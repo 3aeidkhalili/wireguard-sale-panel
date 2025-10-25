@@ -9,8 +9,8 @@
 
 
 
-    (https://raw.githubusercontent.com/3aeidkhalili/wireguard-sale-panel/refs/heads/main/install.sh)
-
+wget -O install.sh https://raw.githubusercontent.com/3aeidkhalili/wireguard-sale-panel/refs/heads/main/install.sh
+bash install.sh
 
 
 دستورات
