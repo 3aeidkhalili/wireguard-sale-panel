@@ -12,6 +12,7 @@ wget -O wg-quota-monitor.sh https://raw.githubusercontent.com/3aeidkhalili/wireg
 bash wg-quota-monitor.sh install-service
 
 systemctl start wg-quota-monitor.service
+
 systemctl status wg-quota-monitor.service
 دستورات
 
