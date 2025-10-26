@@ -1,34 +1,80 @@
+# WireGuard Sale Panel
+پنل مدیریت و فروش WireGuard با قابلیت مدیریت کلاینت‌ها، محدودیت حجم داده، و تاریخ انقضا. این ابزار به شما امکان می‌دهد تا به راحتی سرور WireGuard خود را نصب، پیکربندی و مدیریت کنید.
 
-دستورات نصب پنل :
+---
 
+## پیش‌نیازها
+- سیستم‌عامل: **Ubuntu 20.04 یا بالاتر**، **Debian 10 یا بالاتر**
+- دسترسی **root** یا کاربر با امتیازات **sudo**
+- اتصال اینترنت پایدار
+
+---
+
+## نصب و راه‌اندازی
+### ۱. نصب پنل مدیریت WireGuard
+برای نصب و پیکربندی کامل WireGuard، دستورات زیر را اجرا کنید:
+
+```bash
 wget -O install.sh https://raw.githubusercontent.com/3aeidkhalili/wireguard-sale-panel/refs/heads/main/install.sh
-
 bash install.sh
 
-دستورات نصب سیستم مدیریت حجم :
 
 wget -O wg-quota-monitor.sh https://raw.githubusercontent.com/3aeidkhalili/wireguard-sale-panel/refs/heads/main/wg-quota-monitor.sh
-
 bash wg-quota-monitor.sh install-service
-
 systemctl start wg-quota-monitor.service
-
 systemctl status wg-quota-monitor.service
-دستورات
 
-install: نصب و پیکربندی کامل WireGuard (پیش‌فرض)<br>
-add-client NAME [GB] [DAYS]: افزودن کلاینت با محدودیت داده و تاریخ انقضا<br>
-remove-client NAME: حذف کلاینت<br>
-set-quota NAME GB DAYS: تنظیم محدودیت داده برای کلاینت موجود<br>
-list-clients: نمایش لیست تمام کلاینت‌ها با محدودیت‌هایشان<br>
-status: نمایش وضعیت WireGuard<br>
-web: نصب یا به‌روزرسانی پنل وب<br>
-help: نمایش راهنما<br>
+دستورات موجود
+پنل مدیریت WireGuard از دستورات زیر پشتیبانی می‌کند:
 
-مثال‌ها
 
-./install.sh install<br>
-./install.sh add-client john 5 30 # 5 گیگابایت برای 30 روز<br>
-./install.sh add-client jane 0 90 # داده نامحدود برای 90 روز<br>
-./install.sh list-clients<br>
-./install.sh remove-client john<br>
+
+
+### تغییرات اعمال‌شده:
+1. **ساختار markdown**: استفاده از سرفصل‌ها، جداول، و قالب‌بندی کد برای خوانایی بهتر.
+2. **اضافه کردن پیش‌نیازها**: مشخص کردن سیستم‌عامل‌های پشتیبانی‌شده و نیازهای اولیه.
+3. **توضیحات واضح‌تر**: هر بخش با توضیحات مختصر و مفید همراه شده است.
+4. **جدول دستورات**: برای نمایش بهتر دستورات و توضیحات آن‌ها.
+5. **لحن حرفه‌ای**: استفاده از لحن رسمی و مناسب برای مستندات فنی.
+6. **نکات و پشتیبانی**: اضافه کردن بخش نکات و راه‌های تماس برای پشتیبانی.
+7. **مثال‌های مرتب**: مثال‌ها به صورت منظم و با توضیحات واضح ارائه شده‌اند.
+
+این نسخه برای استفاده در گیت‌هاب بسیار مناسب است و به کاربران کمک می‌کند تا به راحتی مراحل نصب و استفاده را دنبال کنند. اگر نیاز به تغییرات خاصی دارید یا بخشی را می‌خواهید اضافه/حذف کنید، اطلاع دهید!
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+دستورتوضیحاتinstallنصب و پیکربندی کامل WireGuard (پیش‌فرض)add-client NAME [GB] [DAYS]افزودن کلاینت جدید با نام، محدودیت حجم (گیگابایت) و مدت زمان (روز)remove-client NAMEحذف کلاینت با نام مشخصset-quota NAME GB DAYSتنظیم محدودیت حجم و زمان برای کلاینت موجودlist-clientsنمایش لیست تمام کلاینت‌ها به همراه جزئیات محدودیت‌هاstatusنمایش وضعیت فعلی سرویس WireGuardwebنصب یا به‌روزرسانی پنل وبhelpنمایش راهنمای دستورات
