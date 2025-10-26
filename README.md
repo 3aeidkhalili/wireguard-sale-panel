@@ -1,18 +1,16 @@
-<img width="639" height="413" alt="image" src="https://github.com/user-attachments/assets/15255ae0-0c7f-4218-ae1f-a9891b06a3bd" />
 
-<img width="619" height="857" alt="image" src="https://github.com/user-attachments/assets/4aa4a9d8-0dfa-48ec-9e27-b7bcf510ecf4" />
-
-<img width="1920" height="945" alt="image" src="https://github.com/user-attachments/assets/61d7af22-b3bc-4a41-abd5-39a5f1753ed2" />
-
-<img width="1920" height="1439" alt="image" src="https://github.com/user-attachments/assets/c15b35af-2a66-403a-856a-32491c150440" />
-
-
-
+دستورات نصب پنل :
 
 wget -O install.sh https://raw.githubusercontent.com/3aeidkhalili/wireguard-sale-panel/refs/heads/main/install.sh
 bash install.sh
 
+دستورات نصب سیستم مدیریت حجم :
 
+wget -O wg-quota-monitor.sh https://raw.githubusercontent.com/3aeidkhalili/wireguard-sale-panel/refs/heads/main/wg-quota-monitor.sh
+bash wg-quota-monitor.sh install-service
+
+systemctl start wg-quota-monitor.service
+systemctl status wg-quota-monitor.service
 دستورات
 
 install: نصب و پیکربندی کامل WireGuard (پیش‌فرض)<br>
