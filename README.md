@@ -2,11 +2,13 @@
 دستورات نصب پنل :
 
 wget -O install.sh https://raw.githubusercontent.com/3aeidkhalili/wireguard-sale-panel/refs/heads/main/install.sh
+
 bash install.sh
 
 دستورات نصب سیستم مدیریت حجم :
 
 wget -O wg-quota-monitor.sh https://raw.githubusercontent.com/3aeidkhalili/wireguard-sale-panel/refs/heads/main/wg-quota-monitor.sh
+
 bash wg-quota-monitor.sh install-service
 
 systemctl start wg-quota-monitor.service
