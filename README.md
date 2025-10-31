@@ -1,9 +1,9 @@
-**##👑Demo Admin👑
-**
+                                                                ##👑Demo Admin👑
+
 <img width="1920" height="3385" alt="image" src="https://github.com/user-attachments/assets/9b397f44-840e-4eab-b29f-7cc74ed65fa0" />
 
-**🤷‍♂️Demo User🤷‍♂️
-**
+                                                                 🤷‍♂️Demo User🤷‍♂️
+
 <img width="1920" height="2050" alt="image" src="https://github.com/user-attachments/assets/295148ec-fb89-44eb-9408-cd260418f25d" />
 
 
