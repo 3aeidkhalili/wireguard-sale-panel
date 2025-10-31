@@ -4,7 +4,6 @@
 
 ```bash
 wget -O install.sh https://raw.githubusercontent.com/3aeidkhalili/wireguard-sale-panel/refs/heads/main/install.sh
-bash install.sh
 ```
 
 > پس از اجرای دستور بالا، **منوی نصب** ظاهر می‌شود.  
@@ -158,75 +157,4 @@ journalctl -u wg-web-sync.service -f
 
 ---
 
-<p align="center">
-  <a href="https://github.com/3aeidkhalili/wireguard-sale-panel">⭐ اگر پروژه مفید بود، ستاره بزنید!</a>
-</p>
 
----
-
-<style>
-  body {
-    font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif;
-    line-height: 1.6;
-    color: #333;
-    max-width: 900px;
-    margin: 0 auto;
-    padding: 20px;
-    background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
-  }
-  h1, h2, h3 {
-    color: #2c3e50;
-    border-bottom: 2px solid #3498db;
-    padding-bottom: 10px;
-  }
-  code {
-    background: #f4f4f4;
-    padding: 2px 6px;
-    border-radius: 4px;
-    font-family: 'Courier New', monospace;
-  }
-  pre {
-    background: #2d3748;
-    color: #e2e8f0;
-    padding: 15px;
-    border-radius: 8px;
-    overflow-x: auto;
-    border-left: 4px solid #3498db;
-  }
-  table {
-    width: 100%;
-    border-collapse: collapse;
-    margin: 20px 0;
-  }
-  table th, table td {
-    border: 1px solid #ddd;
-    padding: 12px;
-    text-align: right;
-  }
-  table th {
-    background-color: #3498db;
-    color: white;
-  }
-  blockquote {
-    border-right: 4px solid #3498db;
-    padding: 0 15px;
-    margin: 20px 0;
-    color: #7f8c8d;
-    font-style: italic;
-  }
-</style>
-```
-
----
-
-### نکات مهم:
-- این README کاملاً **ریسپانسیو** و **خوش‌ظاهر** در GitHub است.
-- تمام دستورات به صورت **کپی-پیست** آماده هستند.
-- استایل CSS در انتها قرار داده شده تا در **GitHub Pages** یا **Markdown Viewer**ها بهتر نمایش داده شود.
-- لینک‌های **Issues**، **Stars** و **License** به صورت خودکار کار می‌کنند.
-
----
-
-فقط کافی است این محتوا را در `README.md` ریپوزیتوری خود کپی کنید.  
-اگر خواستید نسخه انگلیسی هم داشته باشید، بگید تا براتون ترجمه کنم! 🌍
-```
