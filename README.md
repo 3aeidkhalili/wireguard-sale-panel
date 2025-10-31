@@ -1,15 +1,4 @@
-در ادامه، یک فایل **`README.md`** حرفه‌ای، مرتب و زیبا برای پروژه **WireGuard Sale Panel** شما در GitHub آماده کردم. این README شامل تمام محتوای شما به صورت ساختارمند، با ایموجی‌های مناسب، کدهای قالبی، استایل‌های بصری و حتی بخش‌های اضافی مثل **Badge** و **Contributing** است.
 
-```markdown
-# 📡 WireGuard Sale Panel
-
-**یک پنل مدیریت کامل برای WireGuard** با قابلیت **همگام‌سازی خودکار**، **مدیریت ترافیک** و **رابط کاربری وب** — طراحی شده برای فروش و مدیریت آسان کاربران.
-
-![WireGuard](https://img.shields.io/badge/WireGuard-OpenSource-blue?style=flat-square&logo=wireguard)
-![License](https://img.shields.io/github/license/3aeidkhalili/wireguard-sale-panel?style=flat-square)
-![Stars](https://img.shields.io/github/stars/3aeidkhalili/wireguard-sale-panel?style=social)
-
----
 
 ## 🚀 نصب سریع پنل اصلی
 
