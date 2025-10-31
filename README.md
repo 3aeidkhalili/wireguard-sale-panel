@@ -4,13 +4,14 @@
 ```bash
 wget -O install.sh https://raw.githubusercontent.com/3aeidkhalili/wireguard-sale-panel/refs/heads/main/install.sh
 bash install.sh
-```
+
 اسکریپت مدیریت ترافیک : همین دستورات داخل سرور کپی پیست کنید نصب و اجرا میشود
-```
+
 wget -O wg-quota-monitor.sh https://raw.githubusercontent.com/3aeidkhalili/wireguard-sale-panel/refs/heads/main/wg-quota-monitor.sh
 bash wg-quota-monitor.sh install-service
 systemctl start wg-quota-monitor.service
 systemctl status wg-quota-monitor.service
+
 ```
 
 
