@@ -17,4 +17,42 @@ systemctl status wg-quota-monitor.service
 
 
 
+یک سرویس systemd ایجاد کنید:
 
+bash
+nano /etc/systemd/system/wg-web-sync.service
+محتوای زیر را اضافه کنید:
+
+ini
+[Unit]
+Description=WireGuard Web Database Sync
+After=network.target
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/bin/wireguard-manager sync-web-db
+User=root
+سپس یک timer ایجاد کنید:
+
+bash
+nano /etc/systemd/system/wg-web-sync.timer
+محتوای زیر را اضافه کنید:
+
+ini
+[Unit]
+Description=Sync WireGuard Web DB every minute
+Requires=wg-web-sync.service
+
+[Timer]
+OnBootSec=1min
+OnUnitActiveSec=1min
+Persistent=true
+
+[Install]
+WantedBy=timers.target
+حالا timer را فعال کنید:
+
+bash
+systemctl daemon-reload
+systemctl enable wg-web-sync.timer
+systemctl start wg-web-sync.timer
