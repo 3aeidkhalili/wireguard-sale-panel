@@ -1072,7 +1072,10 @@ install_web() {
     cat > "$WEB_DIR/index.php" <<'PHP'
 <?php
 header('Content-Type: text/html; charset=utf-8');
-function h($s) { return htmlspecialchars($s, ENT_QUOTES, 'UTF-8'); }
+function h($s)
+{
+    return htmlspecialchars($s, ENT_QUOTES, 'UTF-8');
+}
 
 $ok = false;
 $msg = "";
@@ -1084,7 +1087,8 @@ $clients_list = array();
 $server_info = array();
 
 // دریافت اطلاعات سرور
-function get_server_info() {
+function get_server_info()
+{
     // Primary storage for web-readable DBs
     $web_db_dir = '/var/www/wireguard/db';
 
@@ -1110,7 +1114,8 @@ function get_server_info() {
 }
 
 // دریافت لیست کاربران
-function get_clients_list() {
+function get_clients_list()
+{
     $clients = array();
     $web_db_dir = '/var/www/wireguard/db';
     $web_clients_dir = '/var/www/wireguard/clients';
@@ -1133,12 +1138,12 @@ function get_clients_list() {
         if (strpos($line, '#') === 0) continue;
         $parts = explode('|', $line);
         if (count($parts) < 5) continue;
-        
+
         $name = $parts[0];
         $private_key = $parts[1];  // استخراج private key از دیتابیس
         $ip = $parts[3];
         $created = $parts[4];
-        
+
         // بررسی و خواندن private key از فایل اگر در دیتابیس نباشد
         if (empty($private_key)) {
             $key_file = $web_clients_dir . "/${name}_private.key";
@@ -1146,13 +1151,13 @@ function get_clients_list() {
                 $private_key = trim(file_get_contents($key_file));
             }
         }
-        
+
         // دریافت اطلاعات سهمیه
         $used = 0;
         $limit = 0;
         $expiry = '';
         $active = 1;
-        
+
         if (file_exists($quota_db)) {
             $quota_lines = file($quota_db, FILE_IGNORE_NEW_LINES | FILE_SKIP_EMPTY_LINES);
             foreach ($quota_lines as $qline) {
@@ -1168,12 +1173,12 @@ function get_clients_list() {
                 }
             }
         }
-        
+
         // محاسبات
         $used_gb = round($used / 1024 / 1024 / 1024, 2);
         $limit_gb = round($limit / 1024 / 1024 / 1024, 2);
         $remaining_gb = $limit > 0 ? round(($limit - $used) / 1024 / 1024 / 1024, 2) : '∞';
-        
+
         // محاسبه روزهای باقیمانده
         $days_remaining = 0;
         if ($expiry && $expiry !== '2099-12-31') {
@@ -1183,7 +1188,7 @@ function get_clients_list() {
         } else {
             $days_remaining = '∞';
         }
-        
+
         // خواندن کلید خصوصی
         $private_key = '';
         $private_key_file = "/var/www/wireguard/clients/{$name}_private.key";
@@ -1203,12 +1208,13 @@ function get_clients_list() {
             'active' => $active
         );
     }
-    
+
     return $clients;
 }
 
 // تابع پشتیبان‌گیری
-function create_backup() {
+function create_backup()
+{
     // Store backups under web directory so panel and web user can access them
     $web_backup_root = '/var/www/wireguard/backups';
     if (!is_dir($web_backup_root)) {
@@ -1272,13 +1278,14 @@ function create_backup() {
 }
 
 // تابع بازنشانی پشتیبان
-function restore_backup($backup_file) {
+function restore_backup($backup_file)
+{
     if (!file_exists($backup_file)) {
         return "فایل پشتیبان یافت نشد";
     }
-    
+
     $extract_dir = '/tmp/wireguard-restore-' . date('Y-m-d-H-i-s');
-    
+
     // استخراج فایل آرشیو
     // ensure extraction directory exists
     if (!is_dir($extract_dir)) {
@@ -1289,16 +1296,16 @@ function restore_backup($backup_file) {
     if (!is_dir($extract_dir)) {
         return "خطا در استخراج فایل پشتیبان";
     }
-    
+
     // پیدا کردن دایرکتوری بکاپ
     $backup_dirs = glob($extract_dir . '/wireguard-backup-*');
     if (empty($backup_dirs)) {
         shell_exec("rm -rf " . escapeshellarg($extract_dir));
         return "ساختار پشتیبان نامعتبر است";
     }
-    
+
     $backup_dir = $backup_dirs[0];
-    
+
     // بازنشانی فایل‌ها
     $files_to_restore = [
         'clients.db',
@@ -1310,34 +1317,34 @@ function restore_backup($backup_file) {
         'server_public.key',
         'server_private.key'
     ];
-    
+
     foreach ($files_to_restore as $file) {
         $source = $backup_dir . '/' . $file;
         $destination = '/etc/wireguard/' . $file;
-        
+
         if (file_exists($source)) {
             copy($source, $destination);
             chmod($destination, 600);
         }
     }
-    
+
     // بازنشانی دایرکتوری کلاینت‌ها
     if (is_dir($backup_dir . '/clients')) {
         shell_exec("rm -rf /etc/wireguard/clients");
         shell_exec("cp -r " . escapeshellarg($backup_dir . '/clients') . " /etc/wireguard/ 2>&1");
         shell_exec("chmod -R 600 /etc/wireguard/clients");
     }
-    
+
     // راه‌اندازی مجدد سرویس
     shell_exec("systemctl restart wg-quick@wg0 2>&1");
-    
+
     // همگام‌سازی با دیتابیس وب: copy each file and set ownership
     $web_db_dir = '/var/www/wireguard/db';
     if (!is_dir($web_db_dir)) {
         @mkdir($web_db_dir, 0755, true);
     }
 
-    foreach (['clients.db','quota.db','admin.db','endpoint.db','dns.db'] as $f) {
+    foreach (['clients.db', 'quota.db', 'admin.db', 'endpoint.db', 'dns.db'] as $f) {
         $etc_path = '/etc/wireguard/' . $f;
         $web_path = $web_db_dir . '/' . $f;
         if (file_exists($etc_path)) {
@@ -1366,7 +1373,7 @@ function restore_backup($backup_file) {
 // پردازش درخواست‌های مدیریتی
 if ($_SERVER['REQUEST_METHOD'] === 'POST') {
     $pk = trim($_POST['pk'] ?? '');
-    
+
     if (!empty($pk)) {
         $admin_check_cmd = "sudo /usr/local/bin/wg-admin-is-admin " . escapeshellarg($pk);
         $admin_output = shell_exec($admin_check_cmd . " 2>&1");
@@ -1375,7 +1382,7 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
         if ($is_admin) {
             $ok = true;
             $data = array('client_name' => 'مدیر سیستم', 'ip_address' => 'N/A', 'is_admin' => true);
-            
+
             // دریافت لیست کاربران
             $clients_list = get_clients_list();
             $server_info = get_server_info();
@@ -1394,18 +1401,18 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
                         $days_remaining = $client['days_remaining'] === '∞' ? '∞' : h($client['days_remaining']);
                         $active = $client['active'] ? 'فعال' : 'غیرفعال';
                         $row = "<tr>\n" .
-                               "<td><strong>{$name}</strong></td>\n" .
-                               "<td>{$ip}</td>\n" .
-                               "<td>\n<div class=\"key-container\">\n<input type=\"text\" class=\"private-key\" value=\"{$private_key}\" readonly>\n<button class=\"copy-btn\" onclick=\"copyToClipboard(this)\">📋</button>\n<button class=\"btn\" onclick=\"showKeyModal(this.parentElement.querySelector(\\\'.private-key\\\').value)\">🔍</button>\n</div>\n</td>\n" .
-                               "<td>{$used_gb}</td>\n" .
-                               "<td>{$limit_gb}</td>\n" .
-                               "<td class=\"" . (($client['remaining_gb'] === '∞' || $client['remaining_gb'] > 0) ? 'success' : 'error') . "\"> <strong>{$remaining_gb}</strong></td>\n" .
-                               "<td>{$expiry}</td>\n" .
-                               "<td class=\"" . (($client['days_remaining'] === '∞' || $client['days_remaining'] > 7) ? 'success' : (($client['days_remaining'] > 0) ? 'warning' : 'error')) . "\"><strong>{$days_remaining}</strong></td>\n" .
-                               "<td class=\"" . ($client['active'] ? 'success' : 'error') . "\">{$active}</td>\n" .
-                               "<td>\n<div class=\"controls\">\n<button type=\"button\" onclick=\"showEditForm('{$name}', {$limit_gb}, " . ($days_remaining === '∞' ? 0 : $days_remaining) . ") class=\"btn-warning\" style=\"width:auto;padding:8px 15px;margin:2px;\">✏️ ویرایش</button>\n" .
-                               "<button type=\"button\" onclick=\"if(confirm('آیا از حذف کاربر \' + '{$name}' + '\' مطمئن هستید؟')) sendAdminAction('remove-client', '{$name}')\" class=\"btn-danger\" style=\"width:auto;padding:8px 15px;margin:2px;\">🗑️ حذف</button>\n</div>\n</td>\n" .
-                               "</tr>\n";
+                            "<td><strong>{$name}</strong></td>\n" .
+                            "<td>{$ip}</td>\n" .
+                            "<td>\n<div class=\"key-container\">\n<input type=\"text\" class=\"private-key\" value=\"{$private_key}\" readonly>\n<button class=\"copy-btn\" onclick=\"copyToClipboard(this)\">📋</button>\n<button class=\"btn\" onclick=\"showKeyModal(this.parentElement.querySelector(\\\'.private-key\\\').value)\">🔍</button>\n</div>\n</td>\n" .
+                            "<td>{$used_gb}</td>\n" .
+                            "<td>{$limit_gb}</td>\n" .
+                            "<td class=\"" . (($client['remaining_gb'] === '∞' || $client['remaining_gb'] > 0) ? 'success' : 'error') . "\"> <strong>{$remaining_gb}</strong></td>\n" .
+                            "<td>{$expiry}</td>\n" .
+                            "<td class=\"" . (($client['days_remaining'] === '∞' || $client['days_remaining'] > 7) ? 'success' : (($client['days_remaining'] > 0) ? 'warning' : 'error')) . "\"><strong>{$days_remaining}</strong></td>\n" .
+                            "<td class=\"" . ($client['active'] ? 'success' : 'error') . "\">{$active}</td>\n" .
+                            "<td>\n<div class=\"controls\">\n<button type=\"button\" onclick=\"showEditForm('{$name}', {$limit_gb}, " . ($days_remaining === '∞' ? 0 : $days_remaining) . ") class=\"btn-warning\" style=\"width:auto;padding:8px 15px;margin:2px;\">✏️ ویرایش</button>\n" .
+                            "<button type=\"button\" onclick=\"if(confirm('آیا از حذف کاربر \' + '{$name}' + '\' مطمئن هستید؟')) sendAdminAction('remove-client', '{$name}')\" class=\"btn-danger\" style=\"width:auto;padding:8px 15px;margin:2px;\">🗑️ حذف</button>\n</div>\n</td>\n" .
+                            "</tr>\n";
                         echo $row;
                     }
                 } else {
@@ -1413,28 +1420,28 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
                 }
                 exit;
             }
-            
+
             // پردازش عملیات مدیریتی
             if (isset($_POST['admin_action'])) {
                 $action = $_POST['admin_action'];
                 $param1 = $_POST['param1'] ?? '';
                 $param2 = $_POST['param2'] ?? '';
                 $param3 = $_POST['param3'] ?? '';
-                
+
                 // پردازش بروزرسانی endpoint و DNS
                 if ($action === 'set-endpoint') {
                     $domain = $param1 ?? '';
                     $port = $param2 ?? '1010';
                     $dns = $param3 ?? '1.1.1.1,8.8.8.8';
-                    
+
                     if (!empty($domain) && !empty($port) && !empty($dns)) {
-                        $endpoint_cmd = "sudo /usr/local/bin/wg-update-endpoint " . 
-                                      escapeshellarg($domain) . " " . 
-                                      escapeshellarg($port) . " " . 
-                                      escapeshellarg($dns);
+                        $endpoint_cmd = "sudo /usr/local/bin/wg-update-endpoint " .
+                            escapeshellarg($domain) . " " .
+                            escapeshellarg($port) . " " .
+                            escapeshellarg($dns);
                         $admin_result = shell_exec($endpoint_cmd . " 2>&1");
                         $admin_message = $admin_result ?: "تنظیمات endpoint و DNS با موفقیت به‌روزرسانی شد";
-                        
+
                         // بروزرسانی اطلاعات سرور
                         $server_info = get_server_info();
                     } else {
@@ -1460,12 +1467,12 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
                     if (isset($_FILES['backup_file']) && $_FILES['backup_file']['error'] === UPLOAD_ERR_OK) {
                         $upload_dir = '/tmp/';
                         $backup_file = $upload_dir . basename($_FILES['backup_file']['name']);
-                        
+
                         if (move_uploaded_file($_FILES['backup_file']['tmp_name'], $backup_file)) {
                             $restore_result = restore_backup($backup_file);
                             $admin_message = $restore_result;
                             unlink($backup_file);
-                            
+
                             // بروزرسانی اطلاعات پس از بازنشانی
                             $clients_list = get_clients_list();
                             $server_info = get_server_info();
@@ -1479,14 +1486,14 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
                 // سایر عملیات
                 else {
                     $admin_cmd = "sudo /usr/local/bin/wg-admin " .
-                                 escapeshellarg($action) . " " .
-                                 escapeshellarg($param1) . " " .
-                                 escapeshellarg($param2) . " " .
-                                 escapeshellarg($param3);
+                        escapeshellarg($action) . " " .
+                        escapeshellarg($param1) . " " .
+                        escapeshellarg($param2) . " " .
+                        escapeshellarg($param3);
                     $admin_result = shell_exec($admin_cmd . " 2>&1");
                     $admin_message = $admin_result ?: "دستور اجرا شد";
                 }
-                
+
                 // رفرش اطلاعات
                 $clients_list = get_clients_list();
                 $server_info = get_server_info();
@@ -1516,70 +1523,191 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
 }
 
 // تابع برای بررسی اینکه آیا رشته حاوی کلمه "خطا" است
-function contains_error($str) {
+function contains_error($str)
+{
     return strpos($str, 'خطا') !== false;
 }
+// دريافت اطلاعات لحظه اي سرور
+function get_live_server_stats()
+{
+    $stats = array();
+
+    // اطلاعات CPU
+    $cpu_usage = @shell_exec("top -bn1 | grep 'Cpu(s)' | awk '{print $2}' | cut -d'%' -f1");
+    $stats['cpu_usage'] = floatval(trim($cpu_usage)) ?: 0;
+
+    // اطلاعات حافظه
+    $memory_info = @shell_exec("free -m | grep Mem:");
+    if ($memory_info) {
+        $memory_parts = preg_split('/\s+/', trim($memory_info));
+        $total_memory = $memory_parts[1] ?? 0;
+        $used_memory = $memory_parts[2] ?? 0;
+        $stats['memory_usage'] = $total_memory > 0 ? round(($used_memory / $total_memory) * 100, 1) : 0;
+        $stats['memory_used'] = $used_memory;
+        $stats['memory_total'] = $total_memory;
+    } else {
+        $stats['memory_usage'] = 0;
+        $stats['memory_used'] = 0;
+        $stats['memory_total'] = 0;
+    }
+
+    // اطلاعات ديسك
+    $disk_usage = @shell_exec("df -h / | awk 'NR==2 {print $5}' | tr -d '%'");
+    $stats['disk_usage'] = intval(trim($disk_usage)) ?: 0;
+
+    // اطلاعات ترافيك شبكه (nload)
+    $network_stats = @shell_exec("cat /proc/net/dev | grep -E '(eth0|ens|enp)' | head -1");
+    if ($network_stats) {
+        $network_parts = preg_split('/\s+/', trim($network_stats));
+        $stats['network_rx'] = isset($network_parts[1]) ? round($network_parts[1] / 1024 / 1024, 2) : 0; // MB
+        $stats['network_tx'] = isset($network_parts[9]) ? round($network_parts[9] / 1024 / 1024, 2) : 0; // MB
+    } else {
+        $stats['network_rx'] = 0;
+        $stats['network_tx'] = 0;
+    }
+
+    // آپ تايم سرور
+    $uptime = @shell_exec("uptime -p");
+    $stats['uptime'] = $uptime ? trim($uptime) : 'نامشخص';
+
+    return $stats;
+}
+
+$server_stats = get_live_server_stats();
 ?>
 <!DOCTYPE html>
 <html lang="fa" dir="rtl">
+
 <head>
     <meta charset="utf-8">
     <meta name="viewport" content="width=device-width, initial-scale=1">
+    <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
+
     <title>پنل مدیریت WireGuard</title>
     <style>
-        * { box-sizing: border-box; margin: 0; padding: 0; font-family: vazir, Arial, sans-serif; }
-        body { 
-            font-family: vazir, Arial, sans-serif; 
+        * {
+            box-sizing: border-box;
+            margin: 0;
+            padding: 0;
+            font-family: vazir, Arial, sans-serif;
+        }
+
+        body {
+            font-family: vazir, Arial, sans-serif;
             background: linear-gradient(135deg, #1a1a2e 0%, #16213e 100%);
-            color: #ffffff; 
+            color: #ffffff;
             line-height: 1.6;
             min-height: 100vh;
             padding: 20px;
         }
+
         .container {
             max-width: 1400px;
             margin: 0 auto;
         }
+
         .header {
             text-align: center;
             margin-bottom: 30px;
             padding: 20px;
-            background: rgba(255,255,255,0.1);
+            background: rgba(255, 255, 255, 0.1);
             border-radius: 15px;
             backdrop-filter: blur(10px);
         }
+
         .header h1 {
             color: #4fc3f7;
             margin-bottom: 10px;
             font-size: 2.2em;
         }
+
         .header p {
             color: #ccc;
             font-size: 1.1em;
         }
+
         .card {
-            background: rgba(255,255,255,0.1);
+            background: rgba(255, 255, 255, 0.1);
             border-radius: 15px;
             padding: 25px;
             margin: 20px 0;
             backdrop-filter: blur(10px);
-            border: 1px solid rgba(255,255,255,0.2);
+            border: 1px solid rgba(255, 255, 255, 0.2);
         }
-        input, button, select, textarea {
+
+        input,
+        button,
+        select,
+        textarea {
             padding: 12px 15px;
             border-radius: 10px;
             border: 1px solid #444;
-            background: rgba(0,0,0,0.4);
+            background: rgba(0, 0, 0, 0.4);
             color: #fff;
             width: 100%;
             font-size: 16px;
             margin: 5px 0;
         }
-        input:focus, select:focus, textarea:focus {
+
+        input:focus,
+        select:focus,
+        textarea:focus {
             outline: none;
             border-color: #4fc3f7;
             box-shadow: 0 0 10px rgba(79, 195, 247, 0.3);
         }
+
+        .usage-chart-container {
+            background: linear-gradient(135deg,
+                    rgba(255, 255, 255, 0.07),
+                    rgba(255, 255, 255, 0.03));
+            border: 1px solid rgba(255, 255, 255, 0.1);
+            border-radius: 20px;
+            padding: 20px;
+            margin-bottom: 20px;
+            position: relative;
+            overflow: hidden;
+        }
+
+        .chart-header {
+            display: flex;
+            align-items: center;
+            justify-content: space-between;
+            margin-bottom: 15px;
+        }
+
+        .chart-controls {
+            display: flex;
+            gap: 10px;
+            align-items: center;
+        }
+
+        .chart-timeframe {
+            background: rgba(255, 255, 255, 0.08);
+            border: 1px solid rgba(255, 255, 255, 0.1);
+            border-radius: 10px;
+            padding: 6px 12px;
+            color: var(--text);
+            font-size: 12px;
+            cursor: pointer;
+            transition: all 0.2s ease;
+        }
+
+        .chart-timeframe:hover {
+            background: rgba(255, 255, 255, 0.12);
+        }
+
+        .chart-timeframe.active {
+            background: var(--primary);
+            color: white;
+        }
+
+        .chart-wrapper {
+            position: relative;
+            height: 200px;
+            width: 100%;
+        }
+
         button {
             background: linear-gradient(135deg, #4fc3f7 0%, #2196f3 100%);
             border: none;
@@ -1588,56 +1716,75 @@ function contains_error($str) {
             font-weight: bold;
             transition: all 0.3s ease;
         }
+
         button:hover {
             transform: translateY(-2px);
             box-shadow: 0 5px 15px rgba(33, 150, 243, 0.4);
         }
+
         .grid {
             display: grid;
             grid-template-columns: repeat(auto-fit, minmax(200px, 1fr));
             gap: 15px;
             margin-top: 20px;
         }
+
         .stat {
-            background: rgba(255,255,255,0.1);
+            background: rgba(255, 255, 255, 0.1);
             padding: 20px;
             border-radius: 10px;
             text-align: center;
-            border: 1px solid rgba(255,255,255,0.1);
+            border: 1px solid rgba(255, 255, 255, 0.1);
         }
+
         .stat .value {
             font-size: 1.3em;
             font-weight: bold;
             margin: 10px 0;
         }
+
         .stat .label {
             font-size: 0.9em;
             opacity: 0.8;
             color: #ccc;
         }
-        .success { color: #66bb6a; }
-        .warning { color: #ffb74d; }
-        .error { color: #f44336; }
+
+        .success {
+            color: #66bb6a;
+        }
+
+        .warning {
+            color: #ffb74d;
+        }
+
+        .error {
+            color: #f44336;
+        }
+
         .message {
             padding: 15px;
             border-radius: 10px;
             margin: 15px 0;
             text-align: center;
         }
-        .message.error { 
-            background: rgba(244, 67, 54, 0.2); 
-            border: 1px solid #f44336; 
+
+        .message.error {
+            background: rgba(244, 67, 54, 0.2);
+            border: 1px solid #f44336;
         }
-        .message.success { 
-            background: rgba(76, 175, 80, 0.2); 
-            border: 1px solid #4caf50; 
+
+        .message.success {
+            background: rgba(76, 175, 80, 0.2);
+            border: 1px solid #4caf50;
         }
+
         .help {
             font-size: 0.9em;
             opacity: 0.8;
             margin-top: 10px;
             color: #ccc;
         }
+
         .config-section {
             background: #1e1e1e;
             padding: 20px;
@@ -1646,6 +1793,7 @@ function contains_error($str) {
             direction: ltr;
             text-align: left;
         }
+
         .config-code {
             color: #ccc;
             font-family: 'Courier New', monospace;
@@ -1653,10 +1801,12 @@ function contains_error($str) {
             white-space: pre-wrap;
             word-break: break-all;
         }
+
         .qr-container {
             text-align: center;
             margin: 20px 0;
         }
+
         .qr-image {
             max-width: 300px;
             border: 2px solid #4fc3f7;
@@ -1664,75 +1814,90 @@ function contains_error($str) {
             padding: 10px;
             background: white;
         }
+
         .two-column {
-            display: grid;
             grid-template-columns: 1fr 1fr;
             gap: 20px;
         }
+
         .admin-panel {
             border-left: 4px solid #4fc3f7;
         }
+
         .notice {
             padding: 10px;
             border-radius: 8px;
             margin-bottom: 12px;
         }
+
         .notice.ok {
-            background: rgba(16,185,129,0.08);
-            border: 1px solid rgba(16,185,129,0.12);
+            background: rgba(16, 185, 129, 0.08);
+            border: 1px solid rgba(16, 185, 129, 0.12);
             color: #10b981;
         }
+
         .notice.err {
-            background: rgba(239,68,68,0.06);
-            border: 1px solid rgba(239,68,68,0.12);
+            background: rgba(239, 68, 68, 0.06);
+            border: 1px solid rgba(239, 68, 68, 0.12);
             color: #ef4444;
         }
+
         .controls {
             display: flex;
             gap: 8px;
             flex-wrap: wrap;
         }
+
         .small {
             font-size: 13px;
             color: #94a3b8;
         }
+
         .table-container {
             overflow-x: auto;
             margin: 15px 0;
         }
+
         table {
             width: 100%;
             border-collapse: separate;
             border-spacing: 0;
-            background: rgba(255,255,255,0.05);
+            background: rgba(255, 255, 255, 0.05);
             border-radius: 14px;
             overflow: hidden;
-            box-shadow: 0 2px 16px 0 rgba(0,0,0,0.07);
+            box-shadow: 0 2px 16px 0 rgba(0, 0, 0, 0.07);
         }
-        th, td {
+
+        th,
+        td {
             padding: 12px 8px;
             text-align: center;
-            border-bottom: 1.5px solid rgba(79,195,247,0.08);
+            border-bottom: 1.5px solid rgba(79, 195, 247, 0.08);
             font-size: 15px;
         }
+
         th {
-            background: rgba(79,195,247,0.13);
+            background: rgba(79, 195, 247, 0.13);
             font-weight: bold;
             color: #4fc3f7;
             border-bottom: 2px solid #4fc3f7;
         }
+
         tr {
             transition: background 0.2s;
         }
+
         tr:hover {
-            background: rgba(33,150,243,0.08);
+            background: rgba(33, 150, 243, 0.08);
         }
+
         .key-container {
             display: flex;
             align-items: center;
             gap: 6px;
             justify-content: center;
         }
+
         .private-key {
             font-family: 'Courier New', monospace;
             font-size: 13px;
@@ -1746,9 +1911,11 @@ function contains_error($str) {
             text-align: left;
             transition: box-shadow 0.2s;
         }
+
         .private-key:focus {
             box-shadow: 0 0 0 2px #4fc3f7;
         }
+
         .copy-btn {
             background: #4fc3f7;
             color: #fff;
@@ -1759,42 +1926,53 @@ function contains_error($str) {
             cursor: pointer;
             transition: background 0.2s;
         }
+
         .copy-btn:hover {
             background: #2196f3;
         }
+
         .btn-danger {
             background: linear-gradient(135deg, #f44336, #d32f2f);
         }
+
         .btn-warning {
             background: linear-gradient(135deg, #ff9800, #f57c00);
         }
+
         .btn-success {
             background: linear-gradient(135deg, #4caf50, #388e3c);
         }
+
         .form-row {
             display: grid;
             grid-template-columns: 1fr 1fr;
             gap: 15px;
         }
+
         .refresh-btn {
             background: linear-gradient(135deg, #9c27b0, #7b1fa2);
-            width: auto;
+            width: 328px;
             padding: 8px 15px;
             margin-bottom: 15px;
+            margin-right: 493px;
         }
+
         .admin-section {
             margin: 20px 0;
             padding: 20px;
-            background: rgba(255,255,255,0.05);
+            background: rgba(255, 255, 255, 0.05);
             border-radius: 10px;
         }
+
         .search-box {
             position: relative;
             margin-bottom: 20px;
         }
+
         .search-box input {
             padding-left: 40px;
         }
+
         .search-icon {
             position: absolute;
             left: 15px;
@@ -1802,30 +1980,39 @@ function contains_error($str) {
             transform: translateY(-50%);
             color: #666;
         }
+
         .edit-form {
             display: none;
-            background: rgba(255,255,255,0.05);
+            background: rgba(255, 255, 255, 0.05);
             padding: 15px;
             border-radius: 10px;
             margin: 10px 0;
         }
+
         @media (max-width: 900px) {
             .private-key {
                 width: 110px;
                 font-size: 11px;
             }
-            th, td {
+
+            th,
+            td {
                 font-size: 13px;
                 padding: 8px 4px;
             }
         }
+
         @media (max-width: 768px) {
-            .two-column, .form-row {
+
+            .two-column,
+            .form-row {
                 grid-template-columns: 1fr;
             }
+
             .header h1 {
                 font-size: 1.8em;
             }
+
             .table-container {
                 font-size: 12px;
             }
@@ -1835,13 +2022,14 @@ function contains_error($str) {
         .modal-backdrop {
             position: fixed;
             inset: 0;
-            background: rgba(0,0,0,0.6);
+            background: rgba(0, 0, 0, 0.6);
             display: none;
             align-items: center;
             justify-content: center;
             z-index: 9999;
             padding: 20px;
         }
+
         .modal {
             background: #0f1724;
             color: #e6eef8;
@@ -1849,31 +2037,101 @@ function contains_error($str) {
             max-width: 720px;
             width: 100%;
             padding: 18px;
-            box-shadow: 0 8px 40px rgba(2,6,23,0.6);
-            border: 1px solid rgba(79,195,247,0.12);
-        }
-        .modal .modal-header {
-            display:flex;
-            justify-content:space-between;
-            align-items:center;
-            gap:10px;
-            margin-bottom:10px;
-        }
-        .modal .modal-body {
-            background:#071021;
-            padding:12px;
-            border-radius:8px;
-            font-family: 'Courier New', monospace;
-            direction:ltr;
-            word-break:break-all;
-        }
-        .modal .modal-actions {
-            margin-top:12px;
-            display:flex;
-            gap:8px;
-            justify-content:flex-end;
+            box-shadow: 0 8px 40px rgba(2, 6, 23, 0.6);
+            border: 1px solid rgba(79, 195, 247, 0.12);
         }
 
+        .modal .modal-header {
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            gap: 10px;
+            margin-bottom: 10px;
+        }
+
+        .modal .modal-body {
+            background: #071021;
+            padding: 12px;
+            border-radius: 8px;
+            font-family: 'Courier New', monospace;
+            direction: ltr;
+            word-break: break-all;
+        }
+
+        .modal .modal-actions {
+            margin-top: 12px;
+            display: flex;
+            gap: 8px;
+            justify-content: flex-end;
+        }
+
+        .server-stats-grid {
+            display: grid;
+            grid-template-columns: repeat(auto-fit, minmax(250px, 1fr));
+            gap: 15px;
+            margin: 20px 0;
+        }
+
+        .stat-card {
+            background: rgba(255, 255, 255, 0.08);
+            border-radius: 12px;
+            padding: 20px;
+            text-align: center;
+            border: 1px solid rgba(255, 255, 255, 0.1);
+            transition: all 0.3s ease;
+        }
+
+        .stat-card:hover {
+            transform: translateY(-5px);
+            box-shadow: 0 10px 20px rgba(0, 0, 0, 0.2);
+        }
+
+        .stat-card .icon {
+            font-size: 2em;
+            margin-bottom: 10px;
+        }
+
+        .stat-card .value {
+            font-size: 20px;
+            font-weight: bold;
+            margin: 10px 0;
+        }
+
+        .stat-card .label {
+            font-size: 0.9em;
+            opacity: 0.8;
+            color: #ccc;
+        }
+
+        .progress-bar {
+            height: 8px;
+            background: rgba(255, 255, 255, 0.1);
+            border-radius: 4px;
+            margin: 10px 0;
+            overflow: hidden;
+        }
+
+        .progress {
+            height: 100%;
+            border-radius: 4px;
+            transition: width 0.5s ease;
+        }
+
+        .progress.cpu {
+            background: linear-gradient(90deg, #4fc3f7, #2196f3);
+        }
+
+        .progress.memory {
+            background: linear-gradient(90deg, #66bb6a, #4caf50);
+        }
+
+        .progress.disk {
+            background: linear-gradient(90deg, #ff9800, #f57c00);
+        }
+
+        .progress.network {
+            background: linear-gradient(90deg, #9c27b0, #7b1fa2);
+        }
     </style>
     <script>
         function searchUsers() {
@@ -1881,7 +2139,7 @@ function contains_error($str) {
             const filter = input.value.toLowerCase();
             const table = document.getElementById('clientsTable');
             const tr = table.getElementsByTagName('tr');
-            
+
             for (let i = 1; i < tr.length; i++) {
                 const td = tr[i].getElementsByTagName('td')[0];
                 if (td) {
@@ -1894,18 +2152,18 @@ function contains_error($str) {
                 }
             }
         }
-        
+
         function showEditForm(clientName, currentGB, currentDays) {
             document.getElementById('editClientName').value = clientName;
             document.getElementById('editClientGB').value = currentGB;
             document.getElementById('editClientDays').value = currentDays;
             document.getElementById('editForm').style.display = 'block';
         }
-        
+
         function hideEditForm() {
             document.getElementById('editForm').style.display = 'none';
         }
-        
+
         function confirmDelete(clientName) {
             return confirm('آیا از حذف کاربر "' + clientName + '" مطمئن هستید؟');
         }
@@ -1982,8 +2240,9 @@ function contains_error($str) {
             const backdrop = document.getElementById('keyModalBackdrop');
             if (backdrop) backdrop.style.display = 'none';
         }
-            </script>
+    </script>
 </head>
+
 <body>
     <div class="container">
         <div class="header">
@@ -2058,14 +2317,51 @@ function contains_error($str) {
                                 </div>
                             </div>
                         </div>
+
+                        <!-- بخش اطلاعات سرور -->
+                        <div class="card">
+                            <h2>📊 اطلاعات لحظه‌ای سرور</h2>
+                            <div class="server-stats-grid">
+                                <div class="stat-card">
+                                    <div class="icon">⚡</div>
+                                    <div class="label">مصرف CPU</div>
+                                    <div class="value"><?php echo $server_stats['cpu_usage']; ?>%</div>
+                                    <div class="progress-bar">
+                                        <div class="progress cpu" style="width: <?php echo $server_stats['cpu_usage']; ?>%"></div>
+                                    </div>
+                                </div>
+                                <div class="stat-card">
+                                    <div class="icon">🧠</div>
+                                    <div class="label">مصرف حافظه</div>
+                                    <div class="value"><?php echo $server_stats['memory_usage']; ?>%</div>
+                                    <div class="progress-bar">
+                                        <div class="progress memory" style="width: <?php echo $server_stats['memory_usage']; ?>%"></div>
+                                    </div>
+                                    <div class="small"><?php echo $server_stats['memory_used']; ?>MB / <?php echo $server_stats['memory_total']; ?>MB</div>
+                                </div>
+                                <div class="stat-card">
+                                    <div class="icon">💾</div>
+                                    <div class="label">مصرف دیسک</div>
+                                    <div class="value"><?php echo $server_stats['disk_usage']; ?>%</div>
+                                    <div class="progress-bar">
+                                        <div class="progress disk" style="width: <?php echo $server_stats['disk_usage']; ?>%"></div>
+                                    </div>
+                                </div>
+                                <div class="stat-card">
+                                    <div class="icon">🌐</div>
+                                    <div class="label">ترافیک شبکه</div>
+                                    <div class="value"><?php echo $server_stats['network_rx']; ?>MB ↓ / <?php echo $server_stats['network_tx']; ?>MB ↑</div>
+                                    <div class="progress-bar">
+                                        <div class="progress network" style="width: 50%"></div>
+                                    </div>
+                                    <div class="small">آپلود / دانلود</div>
+                                </div>
+                            </div>
+                            <div class="small" style="text-align: center; margin-top: 10px;">
+                                آپ‌تایم سرور: <?php echo $server_stats['uptime']; ?>
+                            </div>
+                        </div>
                     </div>
-
-                    <!-- دکمه رفرش -->
-                    <form method="post">
-                        <input type="hidden" name="pk" value="<?php echo h($_POST['pk']); ?>">
-                        <button type="submit" class="refresh-btn">🔄 بروزرسانی اطلاعات</button>
-                    </form>
-
                     <!-- مدیریت کاربران -->
                     <div class="admin-section">
                         <h3>👥 مدیریت کاربران</h3>
@@ -2133,37 +2429,37 @@ function contains_error($str) {
                                 <tbody>
                                     <?php if (!empty($clients_list)): ?>
                                         <?php foreach ($clients_list as $client): ?>
-                                        <tr>
-                                            <td><strong><?php echo h($client['name']); ?></strong></td>
-                                            <td><?php echo h($client['ip']); ?></td>
-                                            <td>
-                                                <div class="key-container">
-                                                    <input type="text" class="private-key" value="<?php echo h($client['private_key']); ?>" readonly>
-                                                    <button class="btn" onclick="showKeyModal(this.parentElement.querySelector('.private-key').value)" title="نمایش کامل" style="width:auto;padding:6px 8px;margin:0">🔍</button>
-                                                </div>
-                                            </td>
-                                            <td><?php echo h($client['used_gb']); ?></td>
-                                            <td><?php echo h($client['limit_gb']); ?></td>
-                                            <td class="<?php echo ($client['remaining_gb'] === '∞' || $client['remaining_gb'] > 0) ? 'success' : 'error'; ?>">
-                                                <strong><?php echo h($client['remaining_gb']); ?></strong>
-                                            </td>
-                                            <td><?php echo h($client['expiry']); ?></td>
-                                            <td class="<?php echo ($client['days_remaining'] === '∞' || $client['days_remaining'] > 7) ? 'success' : (($client['days_remaining'] > 0) ? 'warning' : 'error'); ?>">
-                                                <strong><?php echo h($client['days_remaining']); ?></strong>
-                                            </td>
-                                            <td class="<?php echo ($client['active'] ? 'success' : 'error'); ?>">
-                                                <?php echo ($client['active'] ? 'فعال' : 'غیرفعال'); ?>
-                                            </td>
-                                            <td>
-                                                <div class="controls">
-                                                    <button type="button" onclick="showEditForm('<?php echo h($client['name']); ?>', <?php echo h($client['limit_gb']); ?>, <?php echo ($client['days_remaining'] === '∞' ? 0 : h($client['days_remaining'])); ?>)" 
+                                            <tr>
+                                                <td><strong><?php echo h($client['name']); ?></strong></td>
+                                                <td><?php echo h($client['ip']); ?></td>
+                                                <td>
+                                                    <div class="key-container">
+                                                        <input type="text" class="private-key" value="<?php echo h($client['private_key']); ?>" readonly>
+                                                        <button class="btn" onclick="showKeyModal(this.parentElement.querySelector('.private-key').value)" title="نمایش کامل" style="width:auto;padding:6px 8px;margin:0">🔍</button>
+                                                    </div>
+                                                </td>
+                                                <td><?php echo h($client['used_gb']); ?></td>
+                                                <td><?php echo h($client['limit_gb']); ?></td>
+                                                <td class="<?php echo ($client['remaining_gb'] === '∞' || $client['remaining_gb'] > 0) ? 'success' : 'error'; ?>">
+                                                    <strong><?php echo h($client['remaining_gb']); ?></strong>
+                                                </td>
+                                                <td><?php echo h($client['expiry']); ?></td>
+                                                <td class="<?php echo ($client['days_remaining'] === '∞' || $client['days_remaining'] > 7) ? 'success' : (($client['days_remaining'] > 0) ? 'warning' : 'error'); ?>">
+                                                    <strong><?php echo h($client['days_remaining']); ?></strong>
+                                                </td>
+                                                <td class="<?php echo ($client['active'] ? 'success' : 'error'); ?>">
+                                                    <?php echo ($client['active'] ? 'فعال' : 'غیرفعال'); ?>
+                                                </td>
+                                                <td>
+                                                    <div class="controls">
+                                                        <button type="button" onclick="showEditForm('<?php echo h($client['name']); ?>', <?php echo h($client['limit_gb']); ?>, <?php echo ($client['days_remaining'] === '∞' ? 0 : h($client['days_remaining'])); ?>)"
                                                             class="btn-warning" style="width:auto;padding:8px 15px;margin:2px;">
-                                                        ✏️ ویرایش
-                                                    </button>
-                                                    <button type="button" onclick="if(confirm('آیا از حذف کاربر \"' + '<?php echo h($client['name']); ?>' + '\" مطمئن هستید؟')) sendAdminAction('remove-client', '<?php echo h($client['name']); ?>')" class="btn-danger" style="width:auto;padding:8px 15px;margin:2px;">🗑️ حذف</button>
-                                                </div>
-                                            </td>
-                                        </tr>
+                                                            ✏️ ویرایش
+                                                        </button>
+                                                        <button type="button" onclick="if(confirm('آیا از حذف کاربر \"' + ' <?php echo h($client['name']); ?>' + '\" مطمئن هستید؟' )) sendAdminAction('remove-client', '<?php echo h($client['name']); ?>' )" class="btn-danger" style="width:auto;padding:8px 15px;margin:2px;">🗑️ حذف</button>
+                                                    </div>
+                                                </td>
+                                            </tr>
                                         <?php endforeach; ?>
                                     <?php else: ?>
                                         <tr>
@@ -2176,70 +2472,76 @@ function contains_error($str) {
                             </table>
                         </div>
                     </div>
-
+                    <!-- دکمه رفرش -->
+                    <form method="post">
+                        <input type="hidden" name="pk" value="<?php echo h($_POST['pk']); ?>">
+                        <button type="submit" class="refresh-btn">🔄 بروزرسانی اطلاعات</button>
+                    </form>
                     <script>
-            // تابع رفرش خودکار لیست
-            function refreshUserList() {
-                const pkInput = document.querySelector('input[name="pk"]');
-                if (!pkInput) return; // nothing to refresh for non-admin view
+                        // تابع رفرش خودکار لیست
+                        function refreshUserList() {
+                            const pkInput = document.querySelector('input[name="pk"]');
+                            if (!pkInput) return; // nothing to refresh for non-admin view
 
-                fetch(window.location.href, {
-                    method: 'POST',
-                    body: new URLSearchParams({
-                        'action': 'refresh',
-                        'pk': pkInput.value
-                    })
-                })
-                .then(response => response.text())
-                .then(html => {
-                    const parser = new DOMParser();
-                    const doc = parser.parseFromString(html, 'text/html');
-                    const newTable = doc.querySelector('#clientsTable tbody');
-                    if (newTable) {
-                        const tbody = document.querySelector('#clientsTable tbody');
-                        if (tbody) tbody.innerHTML = newTable.innerHTML;
-                    }
-                }).catch(() => {/* ignore network errors silently */});
-            }
+                            fetch(window.location.href, {
+                                    method: 'POST',
+                                    body: new URLSearchParams({
+                                        'action': 'refresh',
+                                        'pk': pkInput.value
+                                    })
+                                })
+                                .then(response => response.text())
+                                .then(html => {
+                                    const parser = new DOMParser();
+                                    const doc = parser.parseFromString(html, 'text/html');
+                                    const newTable = doc.querySelector('#clientsTable tbody');
+                                    if (newTable) {
+                                        const tbody = document.querySelector('#clientsTable tbody');
+                                        if (tbody) tbody.innerHTML = newTable.innerHTML;
+                                    }
+                                }).catch(() => {
+                                    /* ignore network errors silently */
+                                });
+                        }
 
-            // ارسال عملیات مدیریتی به سرور (AJAX) برای حذف/ویرایش بدون لود کامل صفحه
-            function sendAdminAction(action, param1 = '', param2 = '', param3 = '') {
-                const pkInput = document.querySelector('input[name="pk"]');
-                if (!pkInput || !pkInput.value) {
-                    alert('کلید خصوصی مدیر موجود نیست');
-                    return;
-                }
+                        // ارسال عملیات مدیریتی به سرور (AJAX) برای حذف/ویرایش بدون لود کامل صفحه
+                        function sendAdminAction(action, param1 = '', param2 = '', param3 = '') {
+                            const pkInput = document.querySelector('input[name="pk"]');
+                            if (!pkInput || !pkInput.value) {
+                                alert('کلید خصوصی مدیر موجود نیست');
+                                return;
+                            }
 
-                const body = new URLSearchParams();
-                body.append('pk', pkInput.value);
-                body.append('admin_action', action);
-                if (param1 !== '') body.append('param1', param1);
-                if (param2 !== '') body.append('param2', param2);
-                if (param3 !== '') body.append('param3', param3);
+                            const body = new URLSearchParams();
+                            body.append('pk', pkInput.value);
+                            body.append('admin_action', action);
+                            if (param1 !== '') body.append('param1', param1);
+                            if (param2 !== '') body.append('param2', param2);
+                            if (param3 !== '') body.append('param3', param3);
 
-                fetch(window.location.href, {
-                    method: 'POST',
-                    body: body
-                }).then(() => {
-                    // بعد از انجام عملیات، tbody را رفرش کن
-                    refreshUserList();
-                }).catch(() => {
-                    alert('خطا در ارسال درخواست مدیریتی');
-                });
-            }
+                            fetch(window.location.href, {
+                                method: 'POST',
+                                body: body
+                            }).then(() => {
+                                // بعد از انجام عملیات، tbody را رفرش کن
+                                refreshUserList();
+                            }).catch(() => {
+                                alert('خطا در ارسال درخواست مدیریتی');
+                            });
+                        }
 
-            // رفرش خودکار هر 30 ثانیه
-            setInterval(refreshUserList, 30000);
+                        // رفرش خودکار هر 30 ثانیه
+                        setInterval(refreshUserList, 30000);
 
-            // رفرش اولیه در لود صفحه
-            document.addEventListener('DOMContentLoaded', () => {
-                const refreshBtn = document.querySelector('.refresh-btn');
-                if (refreshBtn) {
-                    refreshBtn.addEventListener('click', refreshUserList);
-                }
-            });
-        </script>
-        <!-- تنظیمات سرور -->
+                        // رفرش اولیه در لود صفحه
+                        document.addEventListener('DOMContentLoaded', () => {
+                            const refreshBtn = document.querySelector('.refresh-btn');
+                            if (refreshBtn) {
+                                refreshBtn.addEventListener('click', refreshUserList);
+                            }
+                        });
+                    </script>
+                    <!-- تنظیمات سرور -->
                     <div class="admin-section">
                         <h3>⚙️ تنظیمات سرور</h3>
                         <div style="display:grid;grid-template-columns:1fr 1fr;gap:20px">
@@ -2340,41 +2642,53 @@ function contains_error($str) {
                             <h2>📄 اطلاعات کانفیگ</h2>
                             <div class="config-section">
                                 <pre class="config-code">[Interface]
-PrivateKey = <?php echo h($_POST['pk']); ?></br>
-Address = <?php echo h($data['ip_address']); ?>/24</br>
-DNS = <?php echo h($data['server_dns'] ?? '1.1.1.1,8.8.8.8'); ?></br>
-MTU = 1420</br>
+PrivateKey = <?php echo h($_POST['pk']); ?> 
+Address = <?php echo h($data['ip_address']); ?>/24
+DNS = <?php echo h($data['server_dns'] ?? '1.1.1.1,8.8.8.8'); ?> 
+MTU = 1420
 
 [Peer]
-PublicKey = <?php echo h($data['server_public_key']); ?></br>
-Endpoint = <?php echo h($data['server_endpoint']); ?></br>
-AllowedIPs = 0.0.0.0/0, ::/0</br>
-PersistentKeepalive = 25</pre></br>
+PublicKey = <?php echo h($data['server_public_key']); ?> 
+Endpoint = <?php echo h($data['server_endpoint']); ?> 
+AllowedIPs = 0.0.0.0/0, ::/0
+PersistentKeepalive = 25</pre>
                             </div>
                             <div class="help">
                                 💡 این اطلاعات برای اتصال شما ضروری است. می‌توانید از آن برای تنظیم دستی کلاینت استفاده کنید.
                             </div>
                         </div>
                     </div>
-
+                    <div class="usage-chart-container">
+                        <div class="chart-header">
+                            <h3 style="margin: 0">📈 نمودار مصرف روزانه</h3>
+                            <div class="chart-controls">
+                                <button class="chart-timeframe active" data-days="7">۷ روز</button>
+                                <button class="chart-timeframe" data-days="30">۳۰ روز</button>
+                                <button class="chart-timeframe" data-days="90">۹۰ روز</button>
+                            </div>
+                        </div>
+                        <div class="chart-wrapper">
+                            <canvas id="usageChart" width="1375" height="200" style="display: block; box-sizing: border-box; height: 200px; width: 1375.4px;"></canvas>
+                        </div>
+                    </div>
                     <div>
                         <?php if (!empty($qr_code)): ?>
-                        <div class="card">
-                            <h2>📱 QR Code</h2>
-                            <div class="qr-container">
-                                <img src="data:image/png;base64,<?php echo $qr_code; ?>" alt="QR Code" class="qr-image">
+                            <div class="card">
+                                <h2>📱 QR Code</h2>
+                                <div class="qr-container">
+                                    <img src="data:image/png;base64,<?php echo $qr_code; ?>" alt="QR Code" class="qr-image">
+                                </div>
+                                <div class="help">
+                                    📸 این QR Code را با اپلیکیشن WireGuard اسکن کنید تا به طور خودکار تنظیم شود.
+                                </div>
                             </div>
-                            <div class="help">
-                                📸 این QR Code را با اپلیکیشن WireGuard اسکن کنید تا به طور خودکار تنظیم شود.
-                            </div>
-                        </div>
                         <?php else: ?>
-                        <div class="card">
-                            <h2>📱 QR Code</h2>
-                            <div class="message warning">
-                                ❌ تولید QR Code با مشکل مواجه شد. لطفاً از فایل کانفیگ استفاده کنید.
+                            <div class="card">
+                                <h2>📱 QR Code</h2>
+                                <div class="message warning">
+                                    ❌ تولید QR Code با مشکل مواجه شد. لطفاً از فایل کانفیگ استفاده کنید.
+                                </div>
                             </div>
-                        </div>
                         <?php endif; ?>
                     </div>
                 </div>
@@ -2389,6 +2703,7 @@ PersistentKeepalive = 25</pre></br>
         <?php endif; ?>
     </div>
 </body>
+
 </html>
 PHP
 
@@ -2706,4 +3021,3 @@ case "${1:-}" in
         usage
         ;;
 esac
-
