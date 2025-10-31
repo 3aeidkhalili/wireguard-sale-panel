@@ -2340,16 +2340,16 @@ function contains_error($str) {
                             <h2>📄 اطلاعات کانفیگ</h2>
                             <div class="config-section">
                                 <pre class="config-code">[Interface]
-PrivateKey = <?php echo h($_POST['pk']); ?>
-Address = <?php echo h($data['ip_address']); ?>/24
-DNS = <?php echo h($data['server_dns'] ?? '1.1.1.1,8.8.8.8'); ?>
-MTU = 1420
+PrivateKey = <?php echo h($_POST['pk']); ?></br>
+Address = <?php echo h($data['ip_address']); ?>/24</br>
+DNS = <?php echo h($data['server_dns'] ?? '1.1.1.1,8.8.8.8'); ?></br>
+MTU = 1420</br>
 
 [Peer]
-PublicKey = <?php echo h($data['server_public_key']); ?>
-Endpoint = <?php echo h($data['server_endpoint']); ?>
-AllowedIPs = 0.0.0.0/0, ::/0
-PersistentKeepalive = 25</pre>
+PublicKey = <?php echo h($data['server_public_key']); ?></br>
+Endpoint = <?php echo h($data['server_endpoint']); ?></br>
+AllowedIPs = 0.0.0.0/0, ::/0</br>
+PersistentKeepalive = 25</pre></br>
                             </div>
                             <div class="help">
                                 💡 این اطلاعات برای اتصال شما ضروری است. می‌توانید از آن برای تنظیم دستی کلاینت استفاده کنید.
