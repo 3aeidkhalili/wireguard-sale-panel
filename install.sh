@@ -1657,56 +1657,40 @@ $server_stats = get_live_server_stats();
             box-shadow: 0 0 10px rgba(79, 195, 247, 0.3);
         }
 
-        .usage-chart-container {
-            background: linear-gradient(135deg,
-                    rgba(255, 255, 255, 0.07),
-                    rgba(255, 255, 255, 0.03));
-            border: 1px solid rgba(255, 255, 255, 0.1);
-            border-radius: 20px;
-            padding: 20px;
-            margin-bottom: 20px;
-            position: relative;
-            overflow: hidden;
-        }
+ .chart-container {
+    background: rgba(255, 255, 255, 0.05);
+    border-radius: 12px;
+    padding: 20px;
+    margin: 20px 0;
+}
 
-        .chart-header {
-            display: flex;
-            align-items: center;
-            justify-content: space-between;
-            margin-bottom: 15px;
-        }
+.chart-controls {
+    display: flex;
+    gap: 10px;
+    margin-bottom: 15px;
+    justify-content: center;
+}
 
-        .chart-controls {
-            display: flex;
-            gap: 10px;
-            align-items: center;
-        }
+.chart-timeframe {
+    background: rgba(79, 195, 247, 0.2);
+    border: 1px solid #4fc3f7;
+    border-radius: 20px;
+    padding: 8px 16px;
+    color: #4fc3f7;
+    cursor: pointer;
+    transition: all 0.3s ease;
+}
 
-        .chart-timeframe {
-            background: rgba(255, 255, 255, 0.08);
-            border: 1px solid rgba(255, 255, 255, 0.1);
-            border-radius: 10px;
-            padding: 6px 12px;
-            color: var(--text);
-            font-size: 12px;
-            cursor: pointer;
-            transition: all 0.2s ease;
-        }
+.chart-timeframe:hover,
+.chart-timeframe.active {
+    background: #4fc3f7;
+    color: white;
+}
 
-        .chart-timeframe:hover {
-            background: rgba(255, 255, 255, 0.12);
-        }
-
-        .chart-timeframe.active {
-            background: var(--primary);
-            color: white;
-        }
-
-        .chart-wrapper {
-            position: relative;
-            height: 200px;
-            width: 100%;
-        }
+#usageChart {
+    width: 100% !important;
+    height: 300px !important;
+}
 
         button {
             background: linear-gradient(135deg, #4fc3f7 0%, #2196f3 100%);
@@ -2240,6 +2224,139 @@ $server_stats = get_live_server_stats();
             const backdrop = document.getElementById('keyModalBackdrop');
             if (backdrop) backdrop.style.display = 'none';
         }
+        const sampleData = {
+    7: {
+        labels: ['۶ روز قبل', '۵ روز قبل', '۴ روز قبل', '۳ روز قبل', '۲ روز قبل', 'دیروز', 'امروز'],
+        data: [0.5, 0.8, 1.2, 0.9, 1.5, 2.1, 0.7]
+    },
+    30: {
+        labels: Array.from({length: 30}, (_, i) => `${29-i} روز قبل`).reverse(),
+        data: Array.from({length: 30}, () => Math.random() * 3)
+    },
+    90: {
+        labels: Array.from({length: 12}, (_, i) => `ماه ${i+1}`),
+        data: Array.from({length: 12}, () => Math.random() * 20 + 5)
+    }
+};
+
+let usageChart = null;
+
+// تابع تغییر بازه زمانی نمودار
+function changeTimeframe(days) {
+    // به روزرسانی وضعیت دکمه‌ها
+    document.querySelectorAll('.chart-timeframe').forEach(btn => {
+        btn.classList.remove('active');
+    });
+    event.target.classList.add('active');
+    
+    // به روزرسانی نمودار
+    updateChart(days);
+}
+
+// تابع به روزرسانی نمودار
+function updateChart(days = 7) {
+    const ctx = document.getElementById('usageChart').getContext('2d');
+    const chartData = sampleData[days];
+    
+    if (usageChart) {
+        usageChart.destroy();
+    }
+    
+    usageChart = new Chart(ctx, {
+        type: 'line',
+        data: {
+            labels: chartData.labels,
+            datasets: [{
+                label: 'مصرف داده (GB)',
+                data: chartData.data,
+                borderColor: '#4fc3f7',
+                backgroundColor: 'rgba(79, 195, 247, 0.1)',
+                borderWidth: 2,
+                fill: true,
+                tension: 0.4,
+                pointBackgroundColor: '#4fc3f7',
+                pointBorderColor: '#ffffff',
+                pointBorderWidth: 2,
+                pointRadius: 5,
+                pointHoverRadius: 7
+            }]
+        },
+        options: {
+            responsive: true,
+            maintainAspectRatio: false,
+            plugins: {
+                legend: {
+                    display: true,
+                    position: 'top',
+                    labels: {
+                        color: '#ffffff',
+                        font: {
+                            family: 'Vazir, Arial, sans-serif'
+                        }
+                    }
+                },
+                tooltip: {
+                    backgroundColor: 'rgba(0, 0, 0, 0.8)',
+                    titleColor: '#4fc3f7',
+                    bodyColor: '#ffffff',
+                    rtl: true,
+                    titleFont: {
+                        family: 'Vazir, Arial, sans-serif'
+                    },
+                    bodyFont: {
+                        family: 'Vazir, Arial, sans-serif'
+                    }
+                }
+            },
+            scales: {
+                x: {
+                    ticks: {
+                        color: '#cccccc',
+                        font: {
+                            family: 'Vazir, Arial, sans-serif'
+                        },
+                        maxRotation: 45,
+                        minRotation: 45
+                    },
+                    grid: {
+                        color: 'rgba(255, 255, 255, 0.1)'
+                    }
+                },
+                y: {
+                    ticks: {
+                        color: '#cccccc',
+                        font: {
+                            family: 'Vazir, Arial, sans-serif'
+                        }
+                    },
+                    grid: {
+                        color: 'rgba(255, 255, 255, 0.1)'
+                    },
+                    title: {
+                        display: true,
+                        text: 'گیگابایت (GB)',
+                        color: '#cccccc',
+                        font: {
+                            family: 'Vazir, Arial, sans-serif'
+                        }
+                    }
+                }
+            }
+        }
+    });
+}
+
+// مقداردهی اولیه نمودار هنگام لود صفحه
+document.addEventListener('DOMContentLoaded', function() {
+    updateChart(7);
+});
+
+// اگر کاربر مدیر است، تابع رفرش نمودار را نیز اضافه می‌کنیم
+function refreshChart() {
+    if (usageChart) {
+        updateChart(7); // بازگشت به بازه ۷ روز و رفرش
+    }
+}
     </script>
 </head>
 
@@ -2589,8 +2706,16 @@ $server_stats = get_live_server_stats();
                 <div class="two-column">
                     <div>
                         <div class="card">
-                            <h2>📈 نتیجه بررسی</h2>
+                                                <div class="usage-chart-container">
+                        <div class="chart-header">
+                            <h3 style="margin: 0">📈 نمودار مصرف روزانه</h3>
+                        </div>
+                        <div class="chart-wrapper">
+                            <canvas id="usageChart" width="1375" height="200" style="display: block; box-sizing: border-box; height: 200px; width: 1375.4px;"></canvas>
+                        </div>
+                    </div>
                             <div class="grid">
+                                
                                 <div class="stat">
                                     <div class="label">👤 کاربر</div>
                                     <div class="value"><?php echo h($data['client_name']); ?></div>
@@ -2636,6 +2761,7 @@ $server_stats = get_live_server_stats();
                                     </div>
                                 </div>
                             </div>
+                            
                         </div>
 
                         <div class="card">
@@ -2658,22 +2784,9 @@ PersistentKeepalive = 25</pre>
                             </div>
                         </div>
                     </div>
-                    <div class="usage-chart-container">
-                        <div class="chart-header">
-                            <h3 style="margin: 0">📈 نمودار مصرف روزانه</h3>
-                            <div class="chart-controls">
-                                <button class="chart-timeframe active" data-days="7">۷ روز</button>
-                                <button class="chart-timeframe" data-days="30">۳۰ روز</button>
-                                <button class="chart-timeframe" data-days="90">۹۰ روز</button>
-                            </div>
-                        </div>
-                        <div class="chart-wrapper">
-                            <canvas id="usageChart" width="1375" height="200" style="display: block; box-sizing: border-box; height: 200px; width: 1375.4px;"></canvas>
-                        </div>
-                    </div>
                     <div>
                         <?php if (!empty($qr_code)): ?>
-                            <div class="card">
+                            <div class="card" style="display: inline-grid;margin-right: 355px;">
                                 <h2>📱 QR Code</h2>
                                 <div class="qr-container">
                                     <img src="data:image/png;base64,<?php echo $qr_code; ?>" alt="QR Code" class="qr-image">
