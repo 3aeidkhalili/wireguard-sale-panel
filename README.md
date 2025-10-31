@@ -1,4 +1,4 @@
-markdown
+
 # WireGuard Sale Panel
 
 پنل مدیریت و فروش WireGuard با قابلیت همگام‌سازی خودکار و مانیتورینگ ترافیک
