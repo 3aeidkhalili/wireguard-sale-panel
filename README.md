@@ -6,14 +6,12 @@ wget -O install.sh https://raw.githubusercontent.com/3aeidkhalili/wireguard-sale
 bash install.sh
 ```
 اسکریپت مدیریت ترافیک : همین دستورات داخل سرور کپی پیست کنید نصب و اجرا میشود
-```bash
+
 wget -O wg-quota-monitor.sh https://raw.githubusercontent.com/3aeidkhalili/wireguard-sale-panel/refs/heads/main/wg-quota-monitor.sh
 bash wg-quota-monitor.sh install-service
 systemctl start wg-quota-monitor.service
 systemctl status wg-quota-monitor.service
-```
-تایمر برای اپدیت داده از دیتابیس داخل وب پنل ادمین و یوزر :
-```bash
+
 nano /etc/systemd/system/wg-web-sync.service
 
 [Unit]
