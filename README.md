@@ -15,8 +15,7 @@ systemctl status wg-quota-monitor.service
 تایمر برای اپدیت داده از دیتابیس داخل وب پنل ادمین و یوزر :
 ```bash
 nano /etc/systemd/system/wg-web-sync.service
-```
-```bash
+
 [Unit]
 Description=WireGuard Web Database Sync
 After=network.target
@@ -25,11 +24,9 @@ After=network.target
 Type=oneshot
 ExecStart=/usr/local/bin/wireguard-manager sync-web-db
 User=root
-```
-```bash
+
 nano /etc/systemd/system/wg-web-sync.timer
-```
-```bash
+
 [Unit]
 Description=Sync WireGuard Web DB every minute
 Requires=wg-web-sync.service
@@ -41,8 +38,8 @@ Persistent=true
 
 [Install]
 WantedBy=timers.target
-```
-```bash
+
+
 systemctl daemon-reload
 systemctl enable wg-web-sync.timer
 systemctl start wg-web-sync.timer
