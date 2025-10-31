@@ -1,3 +1,6 @@
+##👑Demo Admin👑
+
+<img width="1920" height="3385" alt="image" src="https://github.com/user-attachments/assets/9b397f44-840e-4eab-b29f-7cc74ed65fa0" />
 
 
 ## 🚀 نصب سریع پنل اصلی
