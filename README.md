@@ -38,50 +38,63 @@ systemctl status wg-quota-monitor.service
 ### ۱. ایجاد سرویس systemd
 
 ```bash
-sudo nano /etc/systemd/system/wg-web-sync.service
+nano /usr/local/bin/wg-sync-web-db.sh
 ```
 
 محتوای زیر را قرار دهید:
 
 ```ini
-[Unit]
-Description=WireGuard Web Database Sync
-After=network.target
+#!/bin/bash
+# Script to sync web database
 
-[Service]
-Type=oneshot
-ExecStart=/usr/local/bin/wireguard-manager sync-web-db
-User=root
+WG_DIR="/etc/wireguard"
+WEB_DIR="/var/www/wireguard"
+
+# Detect web user
+if getent passwd nginx >/dev/null; then
+    web_user="nginx"
+else
+    web_user="www-data"
+fi
+
+# Sync databases
+for db_file in "clients.db" "quota.db" "admin.db" "endpoint.db" "dns.db"; do
+    if [[ -f "$WG_DIR/$db_file" ]]; then
+        cp "$WG_DIR/$db_file" "$WEB_DIR/db/$db_file"
+        chown "$web_user:$web_user" "$WEB_DIR/db/$db_file"
+        chmod 640 "$WEB_DIR/db/$db_file"
+    fi
+done
+
+# Sync clients directory
+if [[ -d "$WG_DIR/clients" ]]; then
+    rsync -aq "$WG_DIR/clients/" "$WEB_DIR/clients/"
+    chown -R "$web_user:$web_user" "$WEB_DIR/clients"
+    find "$WEB_DIR/clients" -type f -name "*_private.key" -exec chmod 600 {} \;
+    find "$WEB_DIR/clients" -type f -name "*_public.key" -exec chmod 644 {} \;
+    find "$WEB_DIR/clients" -type f -name "*.conf" -exec chmod 644 {} \;
+    chmod 750 "$WEB_DIR/clients"
+fi
+
+echo "$(date): Web databases synced" >> /var/log/wg-sync.log
 ```
 
 ### ۲. ایجاد تایمر برای اجرای هر دقیقه
 
 ```bash
-sudo nano /etc/systemd/system/wg-web-sync.timer
+chmod +x /usr/local/bin/wg-sync-web-db.sh
 ```
 
 محتوای زیر را قرار دهید:
 
 ```ini
-[Unit]
-Description=Sync WireGuard Web DB every minute
-Requires=wg-web-sync.service
-
-[Timer]
-OnBootSec=1min
-OnUnitActiveSec=1min
-Persistent=true
-
-[Install]
-WantedBy=timers.target
+crontab -e
 ```
 
 ### ۳. فعال‌سازی تایمر
 
 ```bash
-sudo systemctl daemon-reload
-sudo systemctl enable wg-web-sync.timer
-sudo systemctl start wg-web-sync.timer
+* * * * * /usr/local/bin/wg-sync-web-db.sh >/dev/null 2>&1
 ```
 
 ---
@@ -106,15 +119,10 @@ sudo systemctl start wg-web-sync.timer
 systemctl status wg-quota-monitor.service
 ```
 
-### وضعیت تایمر همگام‌سازی
-```bash
-systemctl status wg-web-sync.timer
-```
 
 ### مشاهده لاگ‌های زنده
 ```bash
 journalctl -u wg-quota-monitor.service -f
-journalctl -u wg-web-sync.service -f
 ```
 
 ---
