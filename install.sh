@@ -224,16 +224,29 @@ update_all_client_configs() {
     mkdir -p "$CLIENTS_DIR"
     echo "$new_endpoint" > "$SERVER_ENDPOINT_DB"
     echo "$new_dns" > "$SERVER_DNS_DB"
+    log "Saved endpoint and DNS to database files"
 
+    local updated_count=0
+    log "Starting client config updates..."
     for client_conf in "$CLIENTS_DIR"/*.conf; do
         [[ -f "$client_conf" ]] || continue
+        log "Processing: $client_conf"
 
-        local private_key address server_pubkey
-        private_key=$(grep -m1 -oP 'PrivateKey\s*=\s*\K\S+' "$client_conf" || true)
-        address=$(grep -m1 -oP 'Address\s*=\s*\K\S+' "$client_conf" || true)
-        server_pubkey=$(grep -m1 -oP 'PublicKey\s*=\s*\K\S+' "$client_conf" || true)
+        local client_name=$(basename "$client_conf" .conf)
+        log "  Client name: $client_name"
+        
+        # Extract values using sed
+        local private_key=$(sed -n 's/^PrivateKey = //p' "$client_conf")
+        log "  Private key extracted: ${private_key:0:20}..."
+        local address=$(sed -n 's/^Address = //p' "$client_conf")
+        log "  Address extracted: $address"
+        local server_pubkey=$(sed -n 's/^PublicKey = //p' "$client_conf")
+        log "  Server pubkey extracted: ${server_pubkey:0:20}..."
 
         if [[ -n "$private_key" && -n "$address" && -n "$server_pubkey" ]]; then
+            log "  All fields valid, updating config..."
+            # Update config file (temporarily disable errexit for this block)
+            set +e
             cat > "$client_conf" <<EOF
 [Interface]
 PrivateKey = $private_key
@@ -247,9 +260,24 @@ Endpoint = $new_endpoint
 AllowedIPs = 0.0.0.0/0, ::/0
 PersistentKeepalive = 25
 EOF
+            set -e
+            log "  Config file written"
+            
+            # Regenerate QR code with new config
+            local qr_file="$CLIENTS_DIR/${client_name}.png"
+            if command -v qrencode >/dev/null 2>&1; then
+                qrencode -t PNG -o "$qr_file" -r "$client_conf" 2>/dev/null || true
+                log "  QR code regenerated"
+            fi
+            
+            updated_count=$((updated_count + 1))
+            ok "  ✓ Updated config for: $client_name"
+        else
+            warn "  ✗ Skipping $client_name - missing fields"
         fi
     done
 
+    # Update server config port
     if [[ -f "$WG_CONF" ]]; then
         if grep -qE '^ListenPort\s*=' "$WG_CONF"; then
             sed -i "s/^ListenPort\s*=.*/ListenPort = $new_port/" "$WG_CONF"
@@ -258,8 +286,15 @@ EOF
         fi
     fi
 
-    systemctl restart "wg-quick@$WG_IFACE" 2>/dev/null || true
-    ok "All client configs updated with new endpoint: $new_endpoint and DNS: $new_dns"
+    # Restart WireGuard service
+    if systemctl is-active --quiet "wg-quick@$WG_IFACE" 2>/dev/null; then
+        systemctl restart "wg-quick@$WG_IFACE" 2>/dev/null || true
+        log "WireGuard service restarted"
+    fi
+    
+    ok "Updated $updated_count client configs with new endpoint: $new_endpoint and DNS: $new_dns"
+    
+    # Sync all changes to web directory
     sync_web_db
 }
 
@@ -384,13 +419,12 @@ sync_web_db() {
         web_user="nginx"
     fi
 
-    log "Syncing web files..."
+    log "Syncing /etc/wireguard to /var/www/wireguard..."
 
     # ساخت دایرکتوری‌های مورد نیاز
     for dir in "$WEB_DIR" "$WEB_DIR/db" "$WEB_DIR/backups" "$WEB_DIR/clients"; do
         if [[ ! -d "$dir" ]]; then
             mkdir -p "$dir"
-            ok "Created directory: $dir"
         fi
         chown "$web_user:$web_user" "$dir"
         if [[ "$dir" == *"/db" ]] || [[ "$dir" == *"/backups" ]]; then
@@ -400,44 +434,33 @@ sync_web_db() {
         fi
     done
 
-    # کپی فایل‌های دیتابیس و کلیدها
+    # کپی فایل‌های دیتابیس از /etc به /var/www/wireguard/db
     for db_file in "$CLIENT_DB" "$QUOTA_DB" "$ADMIN_DB" "$SERVER_ENDPOINT_DB" "$SERVER_DNS_DB"; do
         if [[ -f "$db_file" ]]; then
-            cp "$db_file" "$WEB_DIR/db/$(basename "$db_file")"
+            cp -f "$db_file" "$WEB_DIR/db/$(basename "$db_file")"
             chown "$web_user:$web_user" "$WEB_DIR/db/$(basename "$db_file")"
             chmod 640 "$WEB_DIR/db/$(basename "$db_file")"
         fi
     done
 
-    # کپی فایل‌های دیتابیس
-    for db_file in "$CLIENT_DB" "$QUOTA_DB" "$ADMIN_DB" "$SERVER_ENDPOINT_DB" "$SERVER_DNS_DB"; do
-        if [[ -f "$db_file" ]]; then
-            cp "$db_file" "$WEB_DIR/db/$(basename "$db_file")"
-            chown "$web_user:$web_user" "$WEB_DIR/db/$(basename "$db_file")"
-            chmod 640 "$WEB_DIR/db/$(basename "$db_file")"
-        fi
-    done
-
-    # کپی و تنظیم مجوزهای کلیدها
+    # پاک کردن فایل‌های قدیمی در clients و کپی جدید از /etc
     if [[ -d "$CLIENTS_DIR" ]]; then
-        # استفاده از rsync برای کپی امن فایل‌ها
-        rsync -a "$CLIENTS_DIR/" "$WEB_DIR/clients/"
+        # حذف همه فایل‌های قدیمی در مقصد
+        rm -rf "$WEB_DIR/clients"/* 2>/dev/null || true
+        
+        # کپی تمام فایل‌ها از /etc/wireguard/clients به /var/www/wireguard/clients
+        cp -rf "$CLIENTS_DIR"/* "$WEB_DIR/clients/" 2>/dev/null || true
+        
+        # تنظیم مالکیت و مجوزها
         chown -R "$web_user:$web_user" "$WEB_DIR/clients"
-        
-        # تنظیم مجوزهای مناسب برای انواع مختلف فایل‌ها
-        find "$WEB_DIR/clients" -type f -name "*_private.key" -exec chmod 600 {} \;
-        find "$WEB_DIR/clients" -type f -name "*_public.key" -exec chmod 644 {} \;
-        find "$WEB_DIR/clients" -type f -name "*.conf" -exec chmod 644 {} \;
-        find "$WEB_DIR/clients" -type f -name "*.png" -exec chmod 644 {} \;
-        
-        # تنظیم مجوز دایرکتوری
+        find "$WEB_DIR/clients" -type f -name "*_private.key" -exec chmod 600 {} \; 2>/dev/null || true
+        find "$WEB_DIR/clients" -type f -name "*_public.key" -exec chmod 644 {} \; 2>/dev/null || true
+        find "$WEB_DIR/clients" -type f -name "*.conf" -exec chmod 644 {} \; 2>/dev/null || true
+        find "$WEB_DIR/clients" -type f -name "*.png" -exec chmod 644 {} \; 2>/dev/null || true
         chmod 750 "$WEB_DIR/clients"
     fi
 
-    # بررسی دسترسی
-    if ! su -s /bin/sh "$web_user" -c "test -w '$WEB_DIR/db'"; then
-        err "Warning: Web user ($web_user) cannot write to $WEB_DIR/db"
-    fi
+    ok "Synced all files from /etc/wireguard to /var/www/wireguard"
 }
 
 quota_set() {
@@ -511,6 +534,19 @@ remove_admin() {
     sync_web_db
 }
 
+# Ensure /etc databases exist (copy from web if needed)
+ensure_etc_databases() {
+    if [[ ! -f "$CLIENT_DB" ]] && [[ -f "/var/www/wireguard/db/clients.db" ]]; then
+        log "Restoring /etc databases from /var/www..."
+        mkdir -p "$WG_DIR/clients"
+        cp -f /var/www/wireguard/db/*.db "$WG_DIR/" 2>/dev/null || true
+        cp -rf /var/www/wireguard/clients/* "$WG_DIR/clients/" 2>/dev/null || true
+        chmod 600 "$WG_DIR"/*.db
+        chown root:root "$WG_DIR"/*.db
+        ok "Databases restored to /etc/wireguard"
+    fi
+}
+
 is_admin() {
     local private_key="$1"
     if [[ -z "$private_key" ]]; then
@@ -526,6 +562,7 @@ is_admin() {
 
 # --------------------------- Client Management --------------------------------
 add_client() {
+    ensure_etc_databases
     local name="$1" gb="${2:-0}" days="${3:-30}"
     
     if [[ -z "$name" ]]; then
@@ -535,6 +572,18 @@ add_client() {
     
     if [[ ! -f "$SERVER_PUB" ]]; then
         err "Server not set up. Run 'install' first."
+        return 1
+    fi
+
+    # Check if client already exists
+    if [[ -f "$CLIENTS_DIR/${name}_public.key" ]] || [[ -f "$CLIENTS_DIR/${name}.conf" ]]; then
+        err "Client '$name' already exists. Please use a different name or remove the existing client first."
+        return 1
+    fi
+    
+    # Check if client name exists in database
+    if [[ -f "$CLIENT_DB" ]] && grep -q "^$name|" "$CLIENT_DB" 2>/dev/null; then
+        err "Client '$name' already exists in database. Please use a different name."
         return 1
     fi
 
@@ -580,7 +629,7 @@ AllowedIPs = 0.0.0.0/0, ::/0
 PersistentKeepalive = 25
 EOF
 
-    # Save to database
+    # Save to database (/etc is primary)
     echo "$name|$c_priv|$c_pub|$ip|$(date +%F)" >> "$CLIENT_DB"
     quota_set "$name" "$gb" "$days"
 
@@ -621,62 +670,141 @@ EOF
 }
 
 remove_client() {
+    ensure_etc_databases
     local name="$1"
+    local LOG="/tmp/wireguard_delete.log"
+    
+    echo "========================================" >> "$LOG"
+    echo "$(date '+%Y-%m-%d %H:%M:%S') - Starting deletion for: $name" >> "$LOG"
     
     if [[ -z "$name" ]]; then
+        echo "ERROR: No client name provided" >> "$LOG"
         err "Usage: remove-client NAME"
         return 1
     fi
     
+    echo "Step 1: Checking if client exists..." >> "$LOG"
     local pub_file="$CLIENTS_DIR/${name}_public.key"
     if [[ ! -f "$pub_file" ]]; then
+        echo "ERROR: Client public key not found at $pub_file" >> "$LOG"
         err "Client $name not found"
         return 1
     fi
+    echo "  ✓ Client public key found" >> "$LOG"
     
     local pubkey=$(cat "$pub_file")
+    echo "  Public key: ${pubkey:0:20}..." >> "$LOG"
     
-    # Remove from server config
-    if [[ -f "$WG_CONF" ]]; then
-        sed -i "/PublicKey = $pubkey/,+2d" "$WG_CONF"
-    fi
-    
-    # Remove files
-    rm -f "$CLIENTS_DIR/${name}_public.key" \
-          "$CLIENTS_DIR/${name}_private.key" \
-          "$CLIENTS_DIR/${name}.conf" \
-          "$CLIENTS_DIR/${name}.png" 2>/dev/null || true
-    
-    # determine client IP from clients.db BEFORE removing DB entries
-    ip=""
+    # Step 2: Get client IP from database
+    echo "Step 2: Reading client IP from $CLIENT_DB..." >> "$LOG"
+    local ip=""
     if [[ -f "$CLIENT_DB" ]]; then
         ip=$(grep -m1 "^$name|" "$CLIENT_DB" 2>/dev/null | cut -d'|' -f4 || true)
-    fi
-
-    # Remove from databases
-    if [[ -f "$CLIENT_DB" ]]; then
-        grep -v "^$name|" "$CLIENT_DB" > "${CLIENT_DB}.tmp" 2>/dev/null && mv "${CLIENT_DB}.tmp" "$CLIENT_DB"
-    fi
-
-    if [[ -f "$QUOTA_DB" ]]; then
-        grep -v "^$name|" "$QUOTA_DB" > "${QUOTA_DB}.tmp" 2>/dev/null && mv "${QUOTA_DB}.tmp" "$QUOTA_DB"
-    fi
-
-    # Remove iptables rule and state file for quota monitor (use the IP we captured)
-    CHAIN_NAME="WG-CLIENTS-COUNTS"
-    if [[ -n "$ip" ]] && iptables -C "$CHAIN_NAME" -s "$ip" -m comment --comment "$name" -j RETURN >/dev/null 2>&1; then
-        iptables -D "$CHAIN_NAME" -s "$ip" -m comment --comment "$name" -j RETURN || true
-    fi
-    safe_name=$(echo "$name" | sed 's/[^A-Za-z0-9._-]/_/g')
-    rm -f "/var/lib/wg-quota/${safe_name}.last" 2>/dev/null || true
-
-    # Reload service
-    if systemctl is-active --quiet "wg-quick@$WG_IFACE" 2>/dev/null; then
-        wg syncconf "$WG_IFACE" <(wg-quick strip "$WG_IFACE") >/dev/null 2>&1
+        echo "  Found IP: $ip" >> "$LOG"
+    else
+        echo "  WARNING: clients.db not found!" >> "$LOG"
     fi
     
-    ok "Client $name removed successfully"
-    sync_web_db
+    # Step 3: Remove iptables rule
+    echo "Step 3: Removing iptables rule for $ip..." >> "$LOG"
+    local CHAIN_NAME="WG-CLIENTS-COUNTS"
+    if [[ -n "$ip" ]] && iptables -C "$CHAIN_NAME" -s "$ip" -m comment --comment "$name" -j RETURN >/dev/null 2>&1; then
+        if iptables -D "$CHAIN_NAME" -s "$ip" -m comment --comment "$name" -j RETURN 2>&1 | tee -a "$LOG"; then
+            echo "  ✓ iptables rule removed" >> "$LOG"
+        else
+            echo "  ✗ Failed to remove iptables rule" >> "$LOG"
+        fi
+    else
+        echo "  ⊗ No iptables rule found (already removed or not set)" >> "$LOG"
+    fi
+    
+    # Step 4: Remove quota tracking file
+    echo "Step 4: Removing quota tracking file..." >> "$LOG"
+    local safe_name=$(echo "$name" | sed 's/[^A-Za-z0-9._-]/_/g')
+    if rm -f "/var/lib/wg-quota/${safe_name}.last" 2>>"$LOG"; then
+        echo "  ✓ Quota file removed" >> "$LOG"
+    fi
+    
+    # Step 5: Remove from WireGuard config
+    echo "Step 5: Removing from $WG_CONF..." >> "$LOG"
+    if [[ -f "$WG_CONF" ]]; then
+        local before_lines=$(wc -l < "$WG_CONF")
+        # Escape special characters in public key for sed
+        local escaped_pubkey=$(echo "$pubkey" | sed 's/[\/&]/\\&/g')
+        sed -i "/PublicKey = $escaped_pubkey/,+2d" "$WG_CONF"
+        local after_lines=$(wc -l < "$WG_CONF")
+        echo "  Config lines before: $before_lines, after: $after_lines" >> "$LOG"
+        echo "  ✓ Removed from WireGuard config" >> "$LOG"
+    fi
+    
+    # Step 6: Reload WireGuard
+    echo "Step 6: Reloading WireGuard service..." >> "$LOG"
+    if systemctl is-active --quiet "wg-quick@$WG_IFACE" 2>/dev/null; then
+        if wg syncconf "$WG_IFACE" <(wg-quick strip "$WG_IFACE") 2>&1 | tee -a "$LOG"; then
+            echo "  ✓ WireGuard reloaded" >> "$LOG"
+        fi
+    else
+        echo "  ⊗ WireGuard service not running" >> "$LOG"
+    fi
+    
+    # Step 7: Remove from clients.db
+    echo "Step 7: Removing from $CLIENT_DB..." >> "$LOG"
+    if [[ -f "$CLIENT_DB" ]]; then
+        local before_count=$(grep -c "^" "$CLIENT_DB" 2>/dev/null || echo 0)
+        grep -v "^$name|" "$CLIENT_DB" > "${CLIENT_DB}.tmp" 2>/dev/null
+        mv "${CLIENT_DB}.tmp" "$CLIENT_DB"
+        local after_count=$(grep -c "^" "$CLIENT_DB" 2>/dev/null || echo 0)
+        echo "  Database entries before: $before_count, after: $after_count" >> "$LOG"
+        echo "  ✓ Removed from clients.db" >> "$LOG"
+        
+        # Verify removal
+        if grep -q "^$name|" "$CLIENT_DB" 2>/dev/null; then
+            echo "  ✗✗✗ ERROR: Client still in database after removal!" >> "$LOG"
+        else
+            echo "  ✓✓ VERIFIED: Client removed from database" >> "$LOG"
+        fi
+    fi
+
+    # Step 8: Remove from quota.db
+    echo "Step 8: Removing from $QUOTA_DB..." >> "$LOG"
+    if [[ -f "$QUOTA_DB" ]]; then
+        grep -v "^$name|" "$QUOTA_DB" > "${QUOTA_DB}.tmp" 2>/dev/null
+        mv "${QUOTA_DB}.tmp" "$QUOTA_DB"
+        echo "  ✓ Removed from quota.db" >> "$LOG"
+    fi
+    
+    # Step 9: Remove client files
+    echo "Step 9: Removing client files from $CLIENTS_DIR..." >> "$LOG"
+    for file in "${name}_public.key" "${name}_private.key" "${name}.conf" "${name}.png"; do
+        if [[ -f "$CLIENTS_DIR/$file" ]]; then
+            rm -f "$CLIENTS_DIR/$file" && echo "  ✓ Removed $file" >> "$LOG"
+        fi
+    done
+    
+    echo "Step 10: Syncing to web directory..." >> "$LOG"
+    sync_web_db 2>&1 | tee -a "$LOG"
+    echo "  ✓ Sync completed" >> "$LOG"
+    
+    # Final verification
+    echo "========== FINAL VERIFICATION ==========" >> "$LOG"
+    echo "Checking /etc/wireguard/clients.db:" >> "$LOG"
+    if grep -q "^$name|" /etc/wireguard/clients.db 2>/dev/null; then
+        echo "  ✗✗✗ FAILED: Still in /etc/wireguard/clients.db" >> "$LOG"
+    else
+        echo "  ✓✓ OK: Not in /etc/wireguard/clients.db" >> "$LOG"
+    fi
+    
+    echo "Checking /var/www/wireguard/db/clients.db:" >> "$LOG"
+    if grep -q "^$name|" /var/www/wireguard/db/clients.db 2>/dev/null; then
+        echo "  ✗✗✗ FAILED: Still in /var/www/wireguard/db/clients.db" >> "$LOG"
+    else
+        echo "  ✓✓ OK: Not in /var/www/wireguard/db/clients.db" >> "$LOG"
+    fi
+    
+    echo "$(date '+%Y-%m-%d %H:%M:%S') - Deletion completed for: $name" >> "$LOG"
+    echo "========================================" >> "$LOG"
+    
+    ok "Client $name removed successfully - Check /tmp/wireguard_delete.log for details"
 }
 
 edit_client() {
@@ -810,7 +938,17 @@ detect_php_fpm_sock() {
 # اسکریپت بروزرسانی endpoint
 cat > /usr/local/bin/wg-update-endpoint <<'EOF'
 #!/usr/bin/env bash
-/usr/local/bin/wireguard-manager update-endpoint "$1" "$2" "$3"
+set -euo pipefail
+DOMAIN="${1:-}"
+PORT="${2:-1010}"
+DNS="${3:-1.1.1.1,8.8.8.8}"
+
+if [[ -z "$DOMAIN" ]]; then
+    echo "Usage: $0 DOMAIN [PORT] [DNS]"
+    exit 1
+fi
+
+/usr/local/bin/wireguard-manager update-endpoint "$DOMAIN" "$PORT" "$DNS"
 EOF
 chmod 755 /usr/local/bin/wg-update-endpoint
 
@@ -820,24 +958,34 @@ create_admin_scripts() {
     # اسکریپت بررسی مدیر
     cat > /usr/local/bin/wg-admin-is-admin <<'EOF'
 #!/usr/bin/env bash
-set -euo pipefail
 
 PRIVATE_KEY="${1:-}"
-# prefer web copy of admin db
-WEB_DB_DIR="/var/www/wireguard/db"
-ADMIN_DB="$WEB_DB_DIR/admin.db"
+# /etc is primary source
+ADMIN_DB="/etc/wireguard/admin.db"
 if [[ ! -f "$ADMIN_DB" ]]; then
-    ADMIN_DB="/etc/wireguard/admin.db"
+    ADMIN_DB="/var/www/wireguard/db/admin.db"
 fi
+
+# Debug log
+echo "Checking admin status for key: ${PRIVATE_KEY:0:20}..." >&2
+echo "Using admin DB: $ADMIN_DB" >&2
 
 if [[ -z "$PRIVATE_KEY" ]]; then
     echo "false"
     exit 0
 fi
 
-if [[ -f "$ADMIN_DB" ]] && grep -qFx "$PRIVATE_KEY" "$ADMIN_DB" 2>/dev/null; then
+if [[ ! -f "$ADMIN_DB" ]]; then
+    echo "Admin DB not found: $ADMIN_DB" >&2
+    echo "false"
+    exit 0
+fi
+
+if grep -qFx "$PRIVATE_KEY" "$ADMIN_DB" 2>/dev/null; then
+    echo "Admin key found!" >&2
     echo "true"
 else
+    echo "Admin key not found" >&2
     echo "false"
 fi
 EOF
@@ -848,24 +996,23 @@ EOF
 set -euo pipefail
 
 PRIVATE_KEY="${1:-}"
-# Prefer web-accessible DB copies
-WEB_DB_DIR="/var/www/wireguard/db"
-CLIENT_DB="$WEB_DB_DIR/clients.db"
-QUOTA_DB="$WEB_DB_DIR/quota.db"
+# /etc is primary source
+CLIENT_DB="/etc/wireguard/clients.db"
+QUOTA_DB="/etc/wireguard/quota.db"
 if [[ ! -f "$CLIENT_DB" ]]; then
-    CLIENT_DB="/etc/wireguard/clients.db"
+    CLIENT_DB="/var/www/wireguard/db/clients.db"
 fi
 if [[ ! -f "$QUOTA_DB" ]]; then
-    QUOTA_DB="/etc/wireguard/quota.db"
+    QUOTA_DB="/var/www/wireguard/db/quota.db"
 fi
 SERVER_PUB="/etc/wireguard/server_public.key"
-SERVER_ENDPOINT_DB="$WEB_DB_DIR/endpoint.db"
-SERVER_DNS_DB="$WEB_DB_DIR/dns.db"
+SERVER_ENDPOINT_DB="/etc/wireguard/endpoint.db"
+SERVER_DNS_DB="/etc/wireguard/dns.db"
 if [[ ! -f "$SERVER_ENDPOINT_DB" ]]; then
-    SERVER_ENDPOINT_DB="/etc/wireguard/endpoint.db"
+    SERVER_ENDPOINT_DB="/var/www/wireguard/db/endpoint.db"
 fi
 if [[ ! -f "$SERVER_DNS_DB" ]]; then
-    SERVER_DNS_DB="/etc/wireguard/dns.db"
+    SERVER_DNS_DB="/var/www/wireguard/db/dns.db"
 fi
 
 if [[ -z "$PRIVATE_KEY" ]]; then
@@ -981,41 +1128,84 @@ PARAM3="${4:-}"
 
 WG_SCRIPT="/usr/local/bin/wireguard-manager"
 
+# Check if wireguard-manager exists
+if [[ ! -f "$WG_SCRIPT" ]]; then
+    echo "Error: wireguard-manager not found at $WG_SCRIPT" >&2
+    exit 1
+fi
+
 case "$ACTION" in
     "add-client")
-        "$WG_SCRIPT" add-client "$PARAM1" "$PARAM2" "$PARAM3"
+        if [[ -z "$PARAM1" ]]; then
+            echo "Error: Client name is required" >&2
+            exit 1
+        fi
+        "$WG_SCRIPT" add-client "$PARAM1" "$PARAM2" "$PARAM3" 2>&1
+        exit $?
         ;;
     "edit-client")
-        "$WG_SCRIPT" edit-client "$PARAM1" "$PARAM2" "$PARAM3"
+        if [[ -z "$PARAM1" ]]; then
+            echo "Error: Client name is required" >&2
+            exit 1
+        fi
+        "$WG_SCRIPT" edit-client "$PARAM1" "$PARAM2" "$PARAM3" 2>&1
+        exit $?
         ;;
     "remove-client")
-        "$WG_SCRIPT" remove-client "$PARAM1"
+        if [[ -z "$PARAM1" ]]; then
+            echo "Error: Client name is required" >&2
+            exit 1
+        fi
+        "$WG_SCRIPT" remove-client "$PARAM1" 2>&1
+        exit $?
         ;;
     "set-endpoint")
-        "$WG_SCRIPT" update-endpoint "$PARAM1" "$PARAM2" "$PARAM3"
+        if [[ -z "$PARAM1" ]]; then
+            echo "Error: Domain/IP is required" >&2
+            exit 1
+        fi
+        "$WG_SCRIPT" update-endpoint "$PARAM1" "$PARAM2" "$PARAM3" 2>&1
+        exit $?
         ;;
     "backup")
         echo "Backup functionality would be implemented here"
+        exit 0
         ;;
     "restore")
         echo "Restore functionality would be implemented here"
+        exit 0
         ;;
     *)
-        echo "Invalid action: $ACTION"
+        echo "Error: Invalid action: $ACTION" >&2
+        echo "Valid actions: add-client, edit-client, remove-client, set-endpoint, backup, restore" >&2
         exit 1
         ;;
 esac
 EOF
 
     # اسکریپت‌های وب
-    cat > /usr/local/bin/wg-add-client-web <<'EOF'
+        cat > /usr/local/bin/wg-add-client-web <<'EOF'
 #!/usr/bin/env bash
-/usr/local/bin/wireguard-manager add-client "$1" "$2" "$3"
+set -euo pipefail
+name="${1:-}"; gb="${2:-}"; days="${3:-}"
+/usr/local/bin/wireguard-manager add-client "$name" "$gb" "$days"
+rc=$?
+{
+    echo "$(date +"%Y-%m-%d %H:%M:%S") | ADD  | name=$name | gb=${gb:-} | days=${days:-} | rc=$rc"
+} >> /tmp/wireguard_add.log 2>/dev/null || true
+exit $rc
 EOF
 
-    cat > /usr/local/bin/wg-edit-client-web <<'EOF'
+        cat > /usr/local/bin/wg-edit-client-web <<'EOF'
 #!/usr/bin/env bash
-/usr/local/bin/wireguard-manager edit-client "$1" "$2" "$3"
+set -euo pipefail
+name="${1:-}"; new_gb="${2:-}"; new_days="${3:-}"
+/usr/local/bin/wireguard-manager edit-client "$name" "$new_gb" "$new_days"
+rc=$?
+{
+    echo "$(date +"%Y-%m-%d %H:%M:%S") | EDIT | name=$name | new_gb=${new_gb:-} | new_days=${new_days:-} | rc=$rc"
+} >> /tmp/wireguard_edit.log 2>/dev/null || true
+exit $rc
 EOF
 
     cat > /usr/local/bin/wg-remove-client-web <<'EOF'
@@ -1039,6 +1229,14 @@ www-data ALL=(root) NOPASSWD: /usr/local/bin/wg-edit-client-web
 www-data ALL=(root) NOPASSWD: /usr/local/bin/wg-remove-client-web
 www-data ALL=(root) NOPASSWD: /usr/local/bin/wg-generate-qr
 www-data ALL=(root) NOPASSWD: /usr/local/bin/wg-admin
+nginx ALL=(root) NOPASSWD: /usr/local/bin/wg-admin-is-admin
+nginx ALL=(root) NOPASSWD: /usr/local/bin/wg-update-endpoint
+nginx ALL=(root) NOPASSWD: /usr/local/bin/wg-client-info
+nginx ALL=(root) NOPASSWD: /usr/local/bin/wg-add-client-web
+nginx ALL=(root) NOPASSWD: /usr/local/bin/wg-edit-client-web
+nginx ALL=(root) NOPASSWD: /usr/local/bin/wg-remove-client-web
+nginx ALL=(root) NOPASSWD: /usr/local/bin/wg-generate-qr
+nginx ALL=(root) NOPASSWD: /usr/local/bin/wg-admin
 SUDO
     chmod 440 /etc/sudoers.d/wg-web
     ok "Admin scripts and sudo permissions configured"
@@ -1046,6 +1244,10 @@ SUDO
 
 install_web() {
     log "Installing and configuring web panel..."
+    # Ensure OS detection when running web-install directly
+    if [[ -z "${OS_ID:-}" ]]; then
+        detect_os
+    fi
     
     # Install required packages
     case "$OS_ID" in
@@ -1066,6 +1268,823 @@ install_web() {
     mkdir -p "$WEB_DIR" "$WEB_ASSETS"
     chown -R www-data:www-data "$WEB_DIR" 2>/dev/null || chown -R nginx:nginx "$WEB_DIR" 2>/dev/null || true
     chmod 755 "$WEB_DIR"
+
+    # Create advanced debug page with comprehensive logging
+    cat > "$WEB_DIR/debug.php" <<'DEBUGPHP'
+<?php
+header('Content-Type: text/html; charset=utf-8');
+// Access guard: require valid token from /var/www/wireguard/debug.key
+$keyFile = '/var/www/wireguard/debug.key';
+$token = $_GET['token'] ?? '';
+$okToken = false;
+if (file_exists($keyFile)) {
+    $raw = @file_get_contents($keyFile);
+    $obj = @json_decode($raw, true);
+    if (is_array($obj)) {
+        $savedToken = $obj['token'] ?? '';
+        $expires = intval($obj['expires'] ?? 0);
+        if (!empty($savedToken) && hash_equals($savedToken, (string)$token) && time() <= $expires) {
+            $okToken = true;
+        }
+    }
+}
+if (!$okToken) { http_response_code(403); echo '403 Forbidden'; exit; }
+
+function getStatus($condition) {
+    return $condition ? "✅" : "❌";
+}
+
+function getServiceStatus($service) {
+    $output = shell_exec("systemctl is-active $service 2>&1");
+    $active = trim($output) === 'active';
+    return $active ? "🟢 Active" : "🔴 Inactive";
+}
+
+function getFileStatus($file) {
+    if (!file_exists($file)) return "❌ Not Found";
+    $perms = substr(sprintf('%o', fileperms($file)), -4);
+    $size = filesize($file);
+    return "✅ Exists (perms: $perms, size: " . formatBytes($size) . ")";
+}
+
+function formatBytes($bytes) {
+    if ($bytes < 1024) return $bytes . ' B';
+    if ($bytes < 1048576) return round($bytes / 1024, 2) . ' KB';
+    return round($bytes / 1048576, 2) . ' MB';
+}
+
+function getDiskUsage($path) {
+    $free = disk_free_space($path);
+    $total = disk_total_space($path);
+    $used = $total - $free;
+    $percent = round(($used / $total) * 100, 1);
+    return [
+        'used' => formatBytes($used),
+        'total' => formatBytes($total),
+        'percent' => $percent,
+        'icon' => $percent > 90 ? '🔴' : ($percent > 70 ? '🟡' : '🟢')
+    ];
+}
+?>
+<!DOCTYPE html>
+<html dir="rtl" lang="fa">
+<head>
+    <meta charset="UTF-8">
+    <title>🔍 WireGuard System Debug</title>
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <style>
+        * { margin: 0; padding: 0; box-sizing: border-box;font-family: 'vazir', Tahoma, sans-serif; }
+        body {
+            font-family: 'vazir', Tahoma, sans-serif;
+            background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+            padding: 20px;
+            color: #333;
+        }
+        .container {
+            max-width: 1400px;
+            margin: 0 auto;
+        }
+        .header {
+            background: white;
+            padding: 30px;
+            border-radius: 15px;
+            box-shadow: 0 10px 30px rgba(0,0,0,0.2);
+            margin-bottom: 20px;
+            text-align: center;
+        }
+        .header h1 {
+            color: #667eea;
+            font-size: 2.5em;
+            margin-bottom: 10px;
+        }
+        .grid {
+            display: grid;
+            grid-template-columns: repeat(auto-fit, minmax(350px, 1fr));
+            gap: 20px;
+            margin-bottom: 20px;
+        }
+        .card {
+            background: white;
+            border-radius: 15px;
+            padding: 25px;
+            box-shadow: 0 10px 30px rgba(0,0,0,0.15);
+        }
+        .card h2 {
+            color: #667eea;
+            margin-bottom: 20px;
+            padding-bottom: 10px;
+            border-bottom: 3px solid #667eea;
+            font-size: 1.5em;
+        }
+        .status-item {
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            padding: 12px;
+            margin: 8px 0;
+            background: #f7f9fc;
+            border-radius: 8px;
+            border-right: 4px solid #667eea;
+        }
+        .status-item.error {
+            border-right-color: #e74c3c;
+            background: #fee;
+        }
+        .status-item.warning {
+            border-right-color: #f39c12;
+            background: #fffaf0;
+        }
+        .status-item.success {
+            border-right-color: #2ecc71;
+            background: #f0fff4;
+        }
+        .label {
+            font-weight: 600;
+            color: #555;
+        }
+        .value {
+            font-family: 'Courier New', monospace;
+            color: #667eea;
+            font-weight: bold;
+        }
+        .log-box {
+            background: #1e1e1e;
+            color: #0f0;
+            padding: 20px;
+            border-radius: 10px;
+            font-family: 'Courier New', monospace;
+            font-size: 0.9em;
+            max-height: 500px;
+            overflow-y: auto;
+            white-space: pre-wrap;
+            word-wrap: break-word;
+            direction: ltr;
+            text-align: left;
+        }
+        .log-box::-webkit-scrollbar {
+            width: 10px;
+        }
+        .log-box::-webkit-scrollbar-track {
+            background: #2e2e2e;
+        }
+        .log-box::-webkit-scrollbar-thumb {
+            background: #667eea;
+            border-radius: 5px;
+        }
+        .progress-bar {
+            background: #e0e0e0;
+            border-radius: 10px;
+            height: 25px;
+            overflow: hidden;
+            margin-top: 8px;
+        }
+        .progress-fill {
+            height: 100%;
+            background: linear-gradient(90deg, #2ecc71, #27ae60);
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            color: white;
+            font-weight: bold;
+            font-size: 0.85em;
+            transition: width 0.3s ease;
+        }
+        .progress-fill.warning {
+            background: linear-gradient(90deg, #f39c12, #e67e22);
+        }
+        .progress-fill.danger {
+            background: linear-gradient(90deg, #e74c3c, #c0392b);
+        }
+        .refresh-btn {
+            background: linear-gradient(135deg, #667eea, #764ba2);
+            color: white;
+            border: none;
+            padding: 15px 30px;
+            border-radius: 10px;
+            font-size: 1.1em;
+            cursor: pointer;
+            box-shadow: 0 5px 15px rgba(0,0,0,0.2);
+            transition: transform 0.2s;
+        }
+        .refresh-btn:hover {
+            transform: translateY(-2px);
+            box-shadow: 0 7px 20px rgba(0,0,0,0.3);
+        }
+        .timestamp {
+            text-align: center;
+            color: white;
+            margin: 20px 0;
+            font-size: 1.1em;
+        }
+    </style>
+</head>
+<body>
+<div class="container">
+    <div class="header">
+        <h1>🔍 WireGuard System Diagnostics</h1>
+        <p style="color: #666; margin-top: 10px;">آخرین بروزرسانی: <?php echo date('Y-m-d H:i:s'); ?></p>
+        <button class="refresh-btn" onclick="location.reload()">🔄 بروزرسانی</button>
+    </div>
+
+    <div class="grid">
+        <!-- System Status -->
+        <div class="card">
+            <h2>💻 وضعیت سیستم</h2>
+            <?php
+            $load = sys_getloadavg();
+            $uptime = shell_exec("uptime -p");
+            $disk = getDiskUsage('/');
+            ?>
+            <div class="status-item <?php echo $load[0] > 5 ? 'warning' : 'success'; ?>">
+                <span class="label">📊 بار سیستم (1m)</span>
+                <span class="value"><?php echo round($load[0], 2); ?></span>
+            </div>
+            <div class="status-item success">
+                <span class="label">⏱️ مدت زمان فعالیت</span>
+                <span class="value"><?php echo trim($uptime); ?></span>
+            </div>
+            <div class="status-item <?php echo $disk['percent'] > 80 ? 'warning' : 'success'; ?>">
+                <span class="label"><?php echo $disk['icon']; ?> فضای دیسک</span>
+                <span class="value"><?php echo $disk['used']; ?> / <?php echo $disk['total']; ?></span>
+            </div>
+            <div class="progress-bar">
+                <div class="progress-fill <?php echo $disk['percent'] > 80 ? 'danger' : ($disk['percent'] > 60 ? 'warning' : ''); ?>" 
+                     style="width: <?php echo $disk['percent']; ?>%">
+                    <?php echo $disk['percent']; ?>%
+                </div>
+            </div>
+        </div>
+
+        <!-- Services Status -->
+        <div class="card">
+            <h2>⚙️ وضعیت سرویس‌ها</h2>
+            <?php
+            $services = [
+                'wg-quick@wg0' => 'WireGuard',
+                'nginx' => 'Nginx',
+                'php8.2-fpm' => 'PHP-FPM (8.2)',
+                'php8.1-fpm' => 'PHP-FPM (8.1)',
+                'php8.0-fpm' => 'PHP-FPM (8.0)',
+                'php7.4-fpm' => 'PHP-FPM (7.4)',
+                'php-fpm'    => 'PHP-FPM (generic)'
+            ];
+            foreach ($services as $service => $label) {
+                $status = getServiceStatus($service);
+                $isActive = strpos($status, 'Active') !== false;
+                $class = $isActive ? 'success' : 'error';
+                echo "<div class='status-item $class'>";
+                echo "<span class='label'>$label</span>";
+                echo "<span class='value'>$status</span>";
+                echo "</div>";
+            }
+            ?>
+        </div>
+
+        <!-- Database Files -->
+        <div class="card">
+            <h2>💾 فایل‌های دیتابیس</h2>
+            <?php
+            $databases = [
+                '/etc/wireguard/clients.db' => 'کاربران (ETC)',
+                '/var/www/wireguard/db/clients.db' => 'کاربران (WEB)',
+                '/etc/wireguard/quota.db' => 'سهمیه (ETC)',
+                '/etc/wireguard/admin.db' => 'ادمین (ETC)',
+                '/etc/wireguard/endpoint.db' => 'Endpoint',
+                '/etc/wireguard/dns.db' => 'DNS'
+            ];
+            foreach ($databases as $db => $label) {
+                $status = getFileStatus($db);
+                $exists = file_exists($db);
+                $class = $exists ? 'success' : 'error';
+                $lines = $exists ? count(file($db, FILE_IGNORE_NEW_LINES)) : 0;
+                echo "<div class='status-item $class'>";
+                echo "<span class='label'>$label</span>";
+                echo "<span class='value'>$status" . ($exists ? " ($lines lines)" : "") . "</span>";
+                echo "</div>";
+            }
+            ?>
+        </div>
+
+        <!-- Scripts -->
+        <div class="card">
+            <h2>📜 اسکریپت‌های سیستم</h2>
+            <?php
+            $scripts = [
+                '/usr/local/bin/wg-admin-is-admin' => 'Admin Check',
+                '/usr/local/bin/wg-admin' => 'Admin Manager',
+                '/usr/local/bin/wg-update-endpoint' => 'Update Endpoint',
+                '/usr/local/bin/wireguard-manager' => 'Main Manager'
+            ];
+            foreach ($scripts as $script => $label) {
+                $status = getFileStatus($script);
+                $exists = file_exists($script);
+                $class = $exists ? 'success' : 'error';
+                $executable = $exists && is_executable($script);
+                echo "<div class='status-item $class'>";
+                echo "<span class='label'>" . ($executable ? '✅' : '❌') . " $label</span>";
+                echo "<span class='value'>$status</span>";
+                echo "</div>";
+            }
+            ?>
+        </div>
+
+        <!-- Network Info -->
+        <div class="card">
+            <h2>🌐 اطلاعات شبکه</h2>
+            <?php
+            $wg_info = shell_exec("wg show wg0 2>&1");
+            $has_interface = strpos($wg_info, 'interface: wg0') !== false;
+            $peers_count = substr_count($wg_info, 'peer:');
+            ?>
+            <div class="status-item <?php echo $has_interface ? 'success' : 'error'; ?>">
+                <span class="label">📡 WireGuard Interface</span>
+                <span class="value"><?php echo $has_interface ? '🟢 فعال' : '🔴 غیرفعال'; ?></span>
+            </div>
+            <div class="status-item success">
+                <span class="label">👥 تعداد Peers متصل</span>
+                <span class="value"><?php echo $peers_count; ?></span>
+            </div>
+            <?php
+            $endpoint = file_exists('/etc/wireguard/endpoint.db') ? 
+                        trim(file_get_contents('/etc/wireguard/endpoint.db')) : 'Not Set';
+            $dns = file_exists('/etc/wireguard/dns.db') ? 
+                   trim(file_get_contents('/etc/wireguard/dns.db')) : 'Not Set';
+            ?>
+            <div class="status-item success">
+                <span class="label">🔗 Endpoint</span>
+                <span class="value"><?php echo $endpoint; ?></span>
+            </div>
+            <div class="status-item success">
+                <span class="label">🌍 DNS</span>
+                <span class="value"><?php echo $dns; ?></span>
+            </div>
+        </div>
+
+        <!-- Permissions -->
+        <div class="card">
+            <h2>🔐 دسترسی‌ها</h2>
+            <?php
+            $web_user = 'www-data';
+            if (posix_getpwnam('nginx')) $web_user = 'nginx';
+
+            // Verify sudoers allows panel commands instead of generic whoami
+            $sudo_list = shell_exec("sudo -n -l 2>&1");
+            $can_sudo = strpos($sudo_list ?: '', '/usr/local/bin/wg-admin') !== false;
+            
+            $db_writable = is_writable('/var/www/wireguard/db');
+            $etc_readable = is_readable('/etc/wireguard');
+            ?>
+            <div class="status-item <?php echo $can_sudo ? 'success' : 'error'; ?>">
+                <span class="label">🔑 کاربر وب: <?php echo $web_user; ?></span>
+                <span class="value"><?php echo $can_sudo ? '✅ دسترسی Sudo دارد' : '❌ دسترسی Sudo ندارد'; ?></span>
+            </div>
+            <div class="status-item <?php echo $db_writable ? 'success' : 'error'; ?>">
+                <span class="label">📝 دسترسی نوشتن DB</span>
+                <span class="value"><?php echo $db_writable ? '✅ قابل نوشتن' : '❌ غیرقابل نوشتن'; ?></span>
+            </div>
+            <div class="status-item <?php echo $etc_readable ? 'success' : 'error'; ?>">
+                <span class="label">👁️ دسترسی خواندن /etc</span>
+                <span class="value"><?php echo $etc_readable ? '✅ قابل خواندن' : '❌ غیرقابل خواندن'; ?></span>
+            </div>
+            <?php
+            $sudoers_exists = file_exists('/etc/sudoers.d/wg-web');
+            ?>
+            <div class="status-item <?php echo $sudoers_exists ? 'success' : 'error'; ?>">
+                <span class="label">⚙️ فایل Sudoers</span>
+                <span class="value"><?php echo getFileStatus('/etc/sudoers.d/wg-web'); ?></span>
+            </div>
+        </div>
+    </div>
+
+    <!-- Deletion Log -->
+    <div class="card" style="grid-column: 1 / -1;">
+        <h2>🗑️ لاگ حذف کاربران (آخرین 100 خط)</h2>
+        <div class="log-box">
+<?php
+if (file_exists('/tmp/wireguard_delete.log')) {
+    $lines = file('/tmp/wireguard_delete.log');
+    $last_lines = array_slice($lines, -100);
+    echo htmlspecialchars(implode('', $last_lines));
+} else {
+    echo "📝 هیچ لاگ حذفی موجود نیست.";
+}
+?>
+        </div>
+    </div>
+
+    <!-- Add Client Log -->
+    <div class="card" style="grid-column: 1 / -1;">
+        <h2>➕ لاگ افزودن کاربران (آخرین 100 خط)</h2>
+        <div class="log-box">
+<?php
+if (file_exists('/tmp/wireguard_add.log')) {
+    $lines = file('/tmp/wireguard_add.log');
+    $last_lines = array_slice($lines, -100);
+    echo htmlspecialchars(implode('', $last_lines));
+} else {
+    echo "📝 هنوز کاربری افزوده نشده است.";
+}
+?>
+        </div>
+    </div>
+
+    <!-- Edit Client Log -->
+    <div class="card" style="grid-column: 1 / -1;">
+        <h2>✏️ لاگ ویرایش کاربران (آخرین 100 خط)</h2>
+        <div class="log-box">
+<?php
+if (file_exists('/tmp/wireguard_edit.log')) {
+    $lines = file('/tmp/wireguard_edit.log');
+    $last_lines = array_slice($lines, -100);
+    echo htmlspecialchars(implode('', $last_lines));
+} else {
+    echo "📝 هنوز ویرایشی ثبت نشده است.";
+}
+?>
+        </div>
+    </div>
+
+    <!-- WireGuard Interface Details -->
+    <div class="card" style="grid-column: 1 / -1;">
+        <h2>🔧 جزئیات WireGuard Interface</h2>
+        <div class="log-box">
+<?php
+$wg_output = shell_exec("wg show wg0 2>&1");
+echo htmlspecialchars($wg_output ?: "⚠️ Unable to retrieve WireGuard interface details");
+?>
+        </div>
+    </div>
+
+    <!-- Active Clients List -->
+    <div class="card" style="grid-column: 1 / -1;">
+        <h2>👥 لیست کاربران فعال</h2>
+        <div class="log-box">
+<?php
+if (file_exists('/etc/wireguard/clients.db')) {
+    $lines = file('/etc/wireguard/clients.db', FILE_IGNORE_NEW_LINES | FILE_SKIP_EMPTY_LINES);
+    foreach ($lines as $line) {
+        if (strpos($line, '#') === 0) {
+            echo "<span style='color: #888;'>$line</span>\n";
+        } else if (trim($line) !== '') {
+            $parts = explode('|', $line);
+            if (count($parts) >= 4) {
+                echo "👤 " . ($parts[0] ?? 'unknown') . " → " . ($parts[3] ?? 'no-ip') . "\n";
+            }
+        }
+    }
+} else {
+    echo "❌ Database not found: /etc/wireguard/clients.db";
+}
+?>
+        </div>
+    </div>
+
+    <!-- Weekly Usage Chart -->
+    <div class="card" style="grid-column: 1 / -1;">
+        <h2>📈 نمودار مصرف هفتگی کاربر</h2>
+        <?php
+        // Build users list from clients.db
+        $users = [];
+        if (file_exists('/etc/wireguard/clients.db')) {
+            foreach (file('/etc/wireguard/clients.db', FILE_IGNORE_NEW_LINES | FILE_SKIP_EMPTY_LINES) as $l) {
+                if (strpos($l, '#') === 0) continue;
+                $p = explode('|', $l);
+                if (count($p) >= 1 && trim($p[0]) !== '') $users[] = trim($p[0]);
+            }
+        }
+        $users = array_unique($users);
+        $user = $_GET['user'] ?? ($users[0] ?? '');
+        $dates = [];
+        for ($i = 6; $i >= 0; $i--) { $dates[] = date('Y-m-d', strtotime("-$i day")); }
+        $vals = [];
+        foreach ($dates as $d) {
+            $f = "/etc/wireguard/usage/$d.csv";
+            $val = 0.0;
+            if (file_exists($f)) {
+                $lines = file($f, FILE_IGNORE_NEW_LINES | FILE_SKIP_EMPTY_LINES);
+                foreach ($lines as $ln) {
+                    $pp = explode('|', $ln);
+                    if (count($pp) >= 2 && $pp[0] === $user) { $val = floatval($pp[1]); break; }
+                }
+            }
+            // convert to MB
+            $vals[] = round($val / 1024 / 1024, 2);
+        }
+        ?>
+        <div style="margin-bottom:12px;">
+            <form method="get" style="display:flex;gap:10px;align-items:center;">
+                <input type="hidden" name="token" value="<?php echo htmlspecialchars($token ?? '', ENT_QUOTES, 'UTF-8'); ?>">
+                <label for="user">کاربر:</label>
+                <select name="user" id="user" onchange="this.form.submit()">
+                    <?php foreach ($users as $u): ?>
+                        <option value="<?php echo htmlspecialchars($u, ENT_QUOTES, 'UTF-8'); ?>" <?php echo ($u === $user ? 'selected' : ''); ?>><?php echo htmlspecialchars($u); ?></option>
+                    <?php endforeach; ?>
+                </select>
+            </form>
+        </div>
+        <canvas id="usageChart" height="110"></canvas>
+        <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
+        <script>
+        (function(){
+            var ctx = document.getElementById('usageChart').getContext('2d');
+            var labels = <?php echo json_encode($dates); ?>;
+            var data = <?php echo json_encode($vals); ?>;
+            new Chart(ctx, {
+                type: 'line',
+                data: { labels: labels, datasets: [{ label: 'مصرف روزانه (MB) - <?php echo htmlspecialchars($user); ?>', data: data, borderColor: '#667eea', backgroundColor: 'rgba(102,126,234,0.2)', tension: 0.25 }] },
+                options: { scales: { y: { beginAtZero: true } }, plugins: { legend: { display: true } } }
+            });
+        })();
+        </script>
+    </div>
+
+    <div class="timestamp">
+        ⚡ Generated in <?php echo round((microtime(true) - $_SERVER['REQUEST_TIME_FLOAT']) * 1000, 2); ?> ms
+    </div>
+</div>
+
+                    <!-- System Status Section -->
+                    <div class="admin-section">
+                        <h3>📊 وضعیت سیستم</h3>
+                        <?php
+                        // System diagnostics
+                        function getSysStatus($condition, $okText, $errorText) {
+                            return $condition ? "✅ $okText" : "❌ $errorText";
+                        }
+                        
+                        function getServiceStat($service) {
+                            $output = @shell_exec("systemctl is-active $service 2>&1");
+                            return trim($output) === 'active';
+                        }
+                        
+                        // Check critical components
+                        $wg_active = getServiceStat('wg-quick@wg0');
+                        $nginx_active = getServiceStat('nginx');
+                        $php_active = getServiceStat('php8.1-fpm') || getServiceStat('php8.0-fpm') || getServiceStat('php7.4-fpm');
+                        $etc_db_exists = file_exists('/etc/wireguard/clients.db');
+                        $web_db_exists = file_exists('/var/www/wireguard/db/clients.db');
+                        $scripts_ok = file_exists('/usr/local/bin/wg-admin') && is_executable('/usr/local/bin/wg-admin');
+                        
+                        // Calculate overall health
+                        $health_score = 0;
+                        $total_checks = 6;
+                        if ($wg_active) $health_score++;
+                        if ($nginx_active) $health_score++;
+                        if ($php_active) $health_score++;
+                        if ($etc_db_exists) $health_score++;
+                        if ($web_db_exists) $health_score++;
+                        if ($scripts_ok) $health_score++;
+                        
+                        $health_percent = round(($health_score / $total_checks) * 100);
+                        $health_color = $health_percent >= 80 ? '#2ecc71' : ($health_percent >= 50 ? '#f39c12' : '#e74c3c');
+                        $health_emoji = $health_percent >= 80 ? '🟢' : ($health_percent >= 50 ? '🟡' : '🔴');
+                        
+                        // Get system info
+                        $load = @sys_getloadavg();
+                        $uptime = @shell_exec("uptime -p");
+                        $wg_peers = substr_count(@shell_exec("wg show wg0 2>&1") ?: '', 'peer:');
+                        $disk_free = @disk_free_space('/');
+                        $disk_total = @disk_total_space('/');
+                        $disk_percent = $disk_total > 0 ? round((($disk_total - $disk_free) / $disk_total) * 100) : 0;
+                        ?>
+                        
+                        <div style="display:grid;grid-template-columns:1fr 1fr 1fr;gap:15px;margin-bottom:20px">
+                            <!-- Overall Health -->
+                            <div class="card" style="padding:20px;text-align:center;background:linear-gradient(135deg, <?php echo $health_color; ?>, <?php echo $health_color; ?>dd)">
+                                <div style="font-size:3em;margin-bottom:10px"><?php echo $health_emoji; ?></div>
+                                <h4 style="color:white;margin:10px 0">سلامت کلی سیستم</h4>
+                                <div style="font-size:2.5em;color:white;font-weight:bold"><?php echo $health_percent; ?>%</div>
+                                <div style="color:rgba(255,255,255,0.9);margin-top:8px">
+                                    <?php echo $health_score; ?> از <?php echo $total_checks; ?> مورد سالم
+                                </div>
+                            </div>
+                            
+                            <!-- Active Users -->
+                            <div class="card" style="padding:20px;text-align:center;background:linear-gradient(135deg, #667eea, #764ba2)">
+                                <div style="font-size:3em;margin-bottom:10px">👥</div>
+                                <h4 style="color:white;margin:10px 0">کاربران متصل</h4>
+                                <div style="font-size:2.5em;color:white;font-weight:bold"><?php echo $wg_peers; ?></div>
+                                <div style="color:rgba(255,255,255,0.9);margin-top:8px">
+                                    Peer<?php echo $wg_peers != 1 ? 's' : ''; ?> فعال
+                                </div>
+                            </div>
+                            
+                            <!-- System Load -->
+                            <div class="card" style="padding:20px;text-align:center;background:linear-gradient(135deg, #f093fb, #f5576c)">
+                                <div style="font-size:3em;margin-bottom:10px">⚡</div>
+                                <h4 style="color:white;margin:10px 0">بار سیستم</h4>
+                                <div style="font-size:2.5em;color:white;font-weight:bold"><?php echo $load ? round($load[0], 2) : 'N/A'; ?></div>
+                                <div style="color:rgba(255,255,255,0.9);margin-top:8px">
+                                    میانگین 1 دقیقه
+                                </div>
+                            </div>
+                        </div>
+
+                        <!-- Detailed Status Grid -->
+                        <div style="display:grid;grid-template-columns:1fr 1fr;gap:15px">
+                            <!-- Services -->
+                            <div class="card" style="padding:15px">
+                                <h4 style="margin:0 0 15px;color:#667eea;border-bottom:2px solid #667eea;padding-bottom:8px">⚙️ سرویس‌ها</h4>
+                                <div style="display:flex;flex-direction:column;gap:10px">
+                                    <div style="display:flex;justify-content:space-between;align-items:center;padding:10px;background:<?php echo $wg_active ? '#e8f5e9' : '#ffebee'; ?>;border-radius:8px">
+                                        <span style="font-weight:600">WireGuard</span>
+                                        <span><?php echo $wg_active ? '🟢 فعال' : '🔴 غیرفعال'; ?></span>
+                                    </div>
+                                    <div style="display:flex;justify-content:space-between;align-items:center;padding:10px;background:<?php echo $nginx_active ? '#e8f5e9' : '#ffebee'; ?>;border-radius:8px">
+                                        <span style="font-weight:600">Nginx</span>
+                                        <span><?php echo $nginx_active ? '🟢 فعال' : '🔴 غیرفعال'; ?></span>
+                                    </div>
+                                    <div style="display:flex;justify-content:space-between;align-items:center;padding:10px;background:<?php echo $php_active ? '#e8f5e9' : '#ffebee'; ?>;border-radius:8px">
+                                        <span style="font-weight:600">PHP-FPM</span>
+                                        <span><?php echo $php_active ? '🟢 فعال' : '🔴 غیرفعال'; ?></span>
+                                    </div>
+                                </div>
+                            </div>
+
+                            <!-- Databases -->
+                            <div class="card" style="padding:15px">
+                                <h4 style="margin:0 0 15px;color:#667eea;border-bottom:2px solid #667eea;padding-bottom:8px">💾 دیتابیس‌ها</h4>
+                                <div style="display:flex;flex-direction:column;gap:10px">
+                                    <div style="display:flex;justify-content:space-between;align-items:center;padding:10px;background:<?php echo $etc_db_exists ? '#e8f5e9' : '#ffebee'; ?>;border-radius:8px">
+                                        <span style="font-weight:600">ETC Database</span>
+                                        <span><?php echo $etc_db_exists ? '✅ موجود' : '❌ ناموجود'; ?></span>
+                                    </div>
+                                    <div style="display:flex;justify-content:space-between;align-items:center;padding:10px;background:<?php echo $web_db_exists ? '#e8f5e9' : '#ffebee'; ?>;border-radius:8px">
+                                        <span style="font-weight:600">WEB Database</span>
+                                        <span><?php echo $web_db_exists ? '✅ موجود' : '❌ ناموجود'; ?></span>
+                                    </div>
+                                    <div style="display:flex;justify-content:space-between;align-items:center;padding:10px;background:<?php echo $scripts_ok ? '#e8f5e9' : '#ffebee'; ?>;border-radius:8px">
+                                        <span style="font-weight:600">Admin Scripts</span>
+                                        <span><?php echo $scripts_ok ? '✅ سالم' : '❌ مشکل دار'; ?></span>
+                                    </div>
+                                </div>
+                            </div>
+
+                            <!-- System Resources -->
+                            <div class="card" style="padding:15px">
+                                <h4 style="margin:0 0 15px;color:#667eea;border-bottom:2px solid #667eea;padding-bottom:8px">💻 منابع سیستم</h4>
+                                <div style="margin-bottom:15px">
+                                    <div style="display:flex;justify-content:space-between;margin-bottom:5px">
+                                        <span style="font-weight:600">💿 فضای دیسک</span>
+                                        <span style="color:<?php echo $disk_percent > 80 ? '#e74c3c' : '#2ecc71'; ?>"><?php echo $disk_percent; ?>%</span>
+                                    </div>
+                                    <div style="background:#e0e0e0;border-radius:10px;height:20px;overflow:hidden">
+                                        <div style="background:<?php echo $disk_percent > 80 ? 'linear-gradient(90deg, #e74c3c, #c0392b)' : 'linear-gradient(90deg, #2ecc71, #27ae60)'; ?>;height:100%;width:<?php echo $disk_percent; ?>%;transition:width 0.3s"></div>
+                                    </div>
+                                </div>
+                                <div style="display:flex;flex-direction:column;gap:8px">
+                                    <div style="display:flex;justify-content:space-between;padding:8px;background:#f7f9fc;border-radius:6px">
+                                        <span>⏱️ Uptime</span>
+                                        <span style="font-size:0.9em"><?php echo trim($uptime) ?: 'N/A'; ?></span>
+                                    </div>
+                                </div>
+                            </div>
+
+                            <!-- Quick Actions -->
+                            <div class="card" style="padding:15px">
+                                <h4 style="margin:0 0 15px;color:#667eea;border-bottom:2px solid #667eea;padding-bottom:8px">🔧 ابزارها</h4>
+                                <div style="display:flex;flex-direction:column;gap:10px">
+                                    <a href="/debug.php" target="_blank" style="display:block;padding:12px;background:linear-gradient(135deg, #667eea, #764ba2);color:white;text-align:center;border-radius:8px;text-decoration:none;font-weight:600">
+                                        🔍 صفحه Debug کامل
+                                    </a>
+                                    <button onclick="location.reload()" style="padding:12px;background:linear-gradient(135deg, #f093fb, #f5576c);color:white;border:none;border-radius:8px;cursor:pointer;font-weight:600">
+                                        🔄 بروزرسانی وضعیت
+                                    </button>
+                                </div>
+                            </div>
+                        </div>
+
+                        <?php if ($health_percent < 80): ?>
+                        <div style="margin-top:20px;padding:15px;background:#fff3cd;border-right:4px solid #ff9800;border-radius:8px">
+                            <strong style="color:#856404">⚠️ هشدار:</strong>
+                            <span style="color:#856404">برخی از اجزای سیستم به درستی کار نمی‌کنند. لطفاً صفحه Debug را بررسی کنید.</span>
+                        </div>
+                        <?php endif; ?>
+                    </div>
+</body>
+</html>
+DEBUGPHP
+
+        chmod 644 "$WEB_DIR/debug.php"
+        # Create admin token endpoint
+        cat > "$WEB_DIR/make_debug_token.php" <<'PHP'
+<?php
+header('Content-Type: application/json; charset=utf-8');
+$pk = trim($_GET['pk'] ?? '');
+if ($pk === '') { echo json_encode(['ok'=>false,'err'=>'no-pk']); exit; }
+$cmd = 'sudo /usr/local/bin/wg-admin-is-admin ' . escapeshellarg($pk);
+$out = shell_exec($cmd . ' 2>&1');
+$lines = preg_split("/\r?\n/", trim((string)$out));
+$is_admin = strtolower(trim(end($lines) ?: '')) === 'true';
+if (!$is_admin) { echo json_encode(['ok'=>false,'err'=>'not-admin']); exit; }
+$token = bin2hex(random_bytes(16));
+$payload = ['token'=>$token, 'expires'=> time()+600];
+file_put_contents('/var/www/wireguard/debug.key', json_encode($payload), LOCK_EX);
+echo json_encode(['ok'=>true, 'url'=> '/debug.php?token=' . $token]);
+PHP
+        chmod 644 "$WEB_DIR/make_debug_token.php"
+
+        # Create admin debug link script and include it in index.php later
+        mkdir -p "$WEB_ASSETS"
+                        cat > "$WEB_ASSETS/admin-debug-link.js" <<'JS'
+    (function() {
+        function hideSearch() {
+            var searchInput = document.querySelector('input[name="pk"]');
+            var searchBox = document.querySelector('.search-box');
+            if (searchBox) searchBox.style.display = 'none';
+            if (searchInput) searchInput.style.display = 'none';
+        }
+        function addButton(url) {
+            var btn = document.createElement('button');
+            btn.textContent = '🔍 صفحه Debug';
+            btn.style.cssText = 'position:fixed;bottom:20px;right:20px;z-index:9999;padding:10px 14px;border:none;border-radius:10px;background:linear-gradient(135deg,#667eea,#764ba2);color:#fff;font-weight:600;cursor:pointer;box-shadow:0 6px 18px rgba(0,0,0,0.22)';
+            btn.onclick = function(){ window.open(url, '_blank'); };
+            document.body.appendChild(btn);
+        }
+        var hasUserView = !!document.querySelector('.qr-image') || !!document.querySelector('.config-section');
+    if (hasUserView) hideSearch();
+        // Try to read pk from the search input; if present, request a token
+        var pkInput = document.querySelector('input[name="pk"]');
+        var pk = pkInput && pkInput.value ? pkInput.value.trim() : '';
+    // If pk exists (admin authenticated), hide search immediately
+    if (pk) hideSearch(); else return;
+        fetch('/make_debug_token.php?pk=' + encodeURIComponent(pk))
+            .then(r => r.json()).then(j => {
+            if (j && j.ok && j.url) { addButton(j.url); }
+            }).catch(() => {});
+    })();
+JS
+        chmod 644 "$WEB_ASSETS/admin-debug-link.js"
+
+            # Ensure index.php loads the admin debug link helper
+            if [ -f "$WEB_DIR/index.php" ] && ! grep -q "admin-debug-link.js" "$WEB_DIR/index.php"; then
+                    echo "<script src=\"/assets/admin-debug-link.js\"></script>" >> "$WEB_DIR/index.php"
+            fi
+
+            # Usage collector script and cron for weekly chart
+            cat > /usr/local/bin/wg-collect-usage <<'BASH'
+    #!/usr/bin/env bash
+    set -euo pipefail
+    DIR=/etc/wireguard/usage
+    STATE="$DIR/state.tsv"
+    TODAY="$(date +%F)"
+    CSV="$DIR/$TODAY.csv"
+    mkdir -p "$DIR"
+
+    # Build IP -> user map from client config files
+    declare -A ip2user
+    shopt -s nullglob
+    for f in /etc/wireguard/clients/*.conf /var/www/wireguard/clients/*.conf; do
+        [ -f "$f" ] || continue
+        name="$(basename "$f" .conf)"
+        addr_line=$(grep -m1 -E '^Address\s*=\s*' "$f" || true)
+        addr=$(echo "$addr_line" | sed -E 's/.*=\s*([^,\/]*)[\/,]?.*/\1/')
+        if [ -n "${addr:-}" ]; then ip2user["$addr"]="$name"; fi
+    done
+
+    # Load previous state
+    declare -A prev
+    if [ -f "$STATE" ]; then
+        while IFS='|' read -r k v; do prev["$k"]="$v"; done < "$STATE"
+    fi
+    > "$STATE.new"
+    declare -A add_bytes
+
+    # Read wg dump: peer|allowed_ips|rx|tx
+    # wg show wg0 dump fields for peers: $1=pubkey $2=psk $3=endpoint $4=allowed-ips $5=latest-handshake $6=rx $7=tx $8=keepalive
+    wg show wg0 dump | awk 'NR>1 {print $1"|"$4"|"$6"|"$7}' | while IFS='|' read -r peer allowed rx tx; do
+        cur=$(( rx + tx ))
+        ip=$(echo "$allowed" | awk -F',' '{print $1}' | sed -E 's#/.*##')
+        user="${ip2user[$ip]:-}"
+        [ -n "$user" ] || continue
+        prevv="${prev[$peer]:-0}"
+        if [ "$cur" -lt "$prevv" ]; then delta=0; else delta=$(( cur - prevv )); fi
+        echo "$peer|$cur" >> "$STATE.new"
+        if [ -n "${add_bytes[$user]:-}" ]; then add_bytes[$user]=$(( ${add_bytes[$user]} + delta )); else add_bytes[$user]=$delta; fi
+    done
+
+    # Atomically replace state
+    mv -f "$STATE.new" "$STATE" 2>/dev/null || cp "$STATE.new" "$STATE"; rm -f "$STATE.new" 2>/dev/null || true
+
+    # Update today's totals CSV
+    if [ -f "$CSV" ]; then cp "$CSV" "$CSV.tmp"; else : > "$CSV.tmp"; fi
+    for u in "${!add_bytes[@]}"; do
+        inc=${add_bytes[$u]}
+        if grep -q -E "^${u}\|" "$CSV.tmp"; then
+            awk -F'|' -v OFS='|' -v U="$u" -v INC="$inc" '{ if ($1==U) {$2=$2+INC} print }' "$CSV.tmp" > "$CSV.new" && mv "$CSV.new" "$CSV.tmp"
+        else
+            echo "$u|$inc" >> "$CSV.tmp"
+        fi
+    done
+    mv -f "$CSV.tmp" "$CSV"
+BASH
+            chmod +x /usr/local/bin/wg-collect-usage
+
+            cat > /etc/cron.d/wg-collect-usage <<'CRON'
+    */5 * * * * root /usr/local/bin/wg-collect-usage >/dev/null 2>&1
+CRON
+            chmod 644 /etc/cron.d/wg-collect-usage
+    ok "Advanced debug page created"
 
     # Create PHP file (Persian interface)
     # [PHP content remains the same as original]
@@ -1089,18 +2108,15 @@ $server_info = array();
 // دریافت اطلاعات سرور
 function get_server_info()
 {
-    // Primary storage for web-readable DBs
-    $web_db_dir = '/var/www/wireguard/db';
-
-    // Prefer web DB copies so the panel shows latest synced values
-    $endpoint = @file_get_contents($web_db_dir . '/endpoint.db');
+    // /etc is primary source, web is just a copy
+    $endpoint = @file_get_contents('/etc/wireguard/endpoint.db');
     if ($endpoint === false || trim($endpoint) === '') {
-        $endpoint = @file_get_contents('/etc/wireguard/endpoint.db');
+        $endpoint = @file_get_contents('/var/www/wireguard/db/endpoint.db');
     }
 
-    $dns = @file_get_contents($web_db_dir . '/dns.db');
+    $dns = @file_get_contents('/etc/wireguard/dns.db');
     if ($dns === false || trim($dns) === '') {
-        $dns = @file_get_contents('/etc/wireguard/dns.db');
+        $dns = @file_get_contents('/var/www/wireguard/db/dns.db');
     }
 
     $status_output = @shell_exec('systemctl is-active wg-quick@wg0 2>/dev/null');
@@ -1117,18 +2133,18 @@ function get_server_info()
 function get_clients_list()
 {
     $clients = array();
-    $web_db_dir = '/var/www/wireguard/db';
-    $web_clients_dir = '/var/www/wireguard/clients';
-    $client_db = $web_db_dir . '/clients.db';
-    $quota_db = $web_db_dir . '/quota.db';
+    // /etc is primary source
+    $client_db = '/etc/wireguard/clients.db';
+    $quota_db = '/etc/wireguard/quota.db';
+    $clients_dir = '/etc/wireguard/clients';
 
-    // Fallback to /etc if web copies missing
+    // Fallback to web if /etc missing
     if (!file_exists($client_db)) {
-        $client_db = '/etc/wireguard/clients.db';
-        $web_clients_dir = '/etc/wireguard/clients';
+        $client_db = '/var/www/wireguard/db/clients.db';
+        $clients_dir = '/var/www/wireguard/clients';
     }
     if (!file_exists($quota_db)) {
-        $quota_db = '/etc/wireguard/quota.db';
+        $quota_db = '/var/www/wireguard/db/quota.db';
     }
 
     if (!file_exists($client_db)) return $clients;
@@ -1146,7 +2162,7 @@ function get_clients_list()
 
         // بررسی و خواندن private key از فایل اگر در دیتابیس نباشد
         if (empty($private_key)) {
-            $key_file = $web_clients_dir . "/${name}_private.key";
+            $key_file = $clients_dir . "/${name}_private.key";
             if (file_exists($key_file)) {
                 $private_key = trim(file_get_contents($key_file));
             }
@@ -1373,15 +2389,32 @@ function restore_backup($backup_file)
 // پردازش درخواست‌های مدیریتی
 if ($_SERVER['REQUEST_METHOD'] === 'POST') {
     $pk = trim($_POST['pk'] ?? '');
+    
+    // Debug logging
+    error_log("POST Request - PK present: " . (!empty($pk) ? "yes" : "no"));
+    error_log("POST Request - Action: " . ($_POST['action'] ?? $_POST['admin_action'] ?? 'none'));
+    
+    // Test sudo execution
+    $test_sudo = shell_exec("sudo -n whoami 2>&1");
+    error_log("Sudo test result: " . ($test_sudo ?: "failed"));
 
     if (!empty($pk)) {
         $admin_check_cmd = "sudo /usr/local/bin/wg-admin-is-admin " . escapeshellarg($pk);
+        error_log("Running command: $admin_check_cmd");
         $admin_output = shell_exec($admin_check_cmd . " 2>&1");
-        $is_admin = (trim($admin_output) === "true");
+        error_log("Admin check raw output: " . ($admin_output ?: "empty"));
+        // Only trust the last line as the boolean result
+        $admin_lines = preg_split("/\r?\n/", trim((string)$admin_output));
+        $admin_last = strtolower(trim(end($admin_lines) ?: ''));
+        $is_admin = ($admin_last === 'true');
+        
+        error_log("Admin check result (parsed): " . ($is_admin ? "true" : "false"));
 
         if ($is_admin) {
             $ok = true;
             $data = array('client_name' => 'مدیر سیستم', 'ip_address' => 'N/A', 'is_admin' => true);
+            // Expose admin PK to JS for subsequent AJAX calls
+            echo "<script>window.ADMIN_PK='" . htmlspecialchars($pk, ENT_QUOTES, 'UTF-8') . "';</script>";
 
             // دریافت لیست کاربران
             $clients_list = get_clients_list();
@@ -1400,6 +2433,7 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
                         $expiry = h($client['expiry']);
                         $days_remaining = $client['days_remaining'] === '∞' ? '∞' : h($client['days_remaining']);
                         $active = $client['active'] ? 'فعال' : 'غیرفعال';
+                        $name_escaped = str_replace("'", "\\'", $name);
                         $row = "<tr>\n" .
                             "<td><strong>{$name}</strong></td>\n" .
                             "<td>{$ip}</td>\n" .
@@ -1410,8 +2444,8 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
                             "<td>{$expiry}</td>\n" .
                             "<td class=\"" . (($client['days_remaining'] === '∞' || $client['days_remaining'] > 7) ? 'success' : (($client['days_remaining'] > 0) ? 'warning' : 'error')) . "\"><strong>{$days_remaining}</strong></td>\n" .
                             "<td class=\"" . ($client['active'] ? 'success' : 'error') . "\">{$active}</td>\n" .
-                            "<td>\n<div class=\"controls\">\n<button type=\"button\" onclick=\"showEditForm('{$name}', {$limit_gb}, " . ($days_remaining === '∞' ? 0 : $days_remaining) . ") class=\"btn-warning\" style=\"width:auto;padding:8px 15px;margin:2px;\">✏️ ویرایش</button>\n" .
-                            "<button type=\"button\" onclick=\"if(confirm('آیا از حذف کاربر \' + '{$name}' + '\' مطمئن هستید؟')) sendAdminAction('remove-client', '{$name}')\" class=\"btn-danger\" style=\"width:auto;padding:8px 15px;margin:2px;\">🗑️ حذف</button>\n</div>\n</td>\n" .
+                            "<td>\n<div class=\"controls\">\n<button type=\"button\" onclick=\"showEditForm('{$name_escaped}', {$limit_gb}, " . ($days_remaining === '∞' ? 0 : $days_remaining) . ")\" class=\"btn-warning\" style=\"width:auto;padding:8px 15px;margin:2px;\">✏️ ویرایش</button>\n" .
+                            "<button type=\"button\" onclick=\"if(confirm('آیا از حذف کاربر {$name_escaped} مطمئن هستید؟')) sendAdminAction('remove-client', '{$name_escaped}')\" class=\"btn-danger\" style=\"width:auto;padding:8px 15px;margin:2px;\">🗑️ حذف</button>\n</div>\n</td>\n" .
                             "</tr>\n";
                         echo $row;
                     }
@@ -1427,6 +2461,8 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
                 $param1 = $_POST['param1'] ?? '';
                 $param2 = $_POST['param2'] ?? '';
                 $param3 = $_POST['param3'] ?? '';
+                
+                error_log("Admin Action: $action, Param1: $param1");
 
                 // پردازش بروزرسانی endpoint و DNS
                 if ($action === 'set-endpoint') {
@@ -1490,8 +2526,28 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
                         escapeshellarg($param1) . " " .
                         escapeshellarg($param2) . " " .
                         escapeshellarg($param3);
+                    
+                    error_log("Executing command: $admin_cmd");
                     $admin_result = shell_exec($admin_cmd . " 2>&1");
-                    $admin_message = $admin_result ?: "دستور اجرا شد";
+                    error_log("Command result: " . ($admin_result ?: "empty"));
+                    
+                    // Check if command succeeded
+                    if ($admin_result !== null && trim($admin_result) !== '') {
+                        // Check if result contains error keywords
+                        if (stripos($admin_result, 'error') !== false || 
+                            stripos($admin_result, 'خطا') !== false ||
+                            stripos($admin_result, 'already exists') !== false ||
+                            stripos($admin_result, 'not found') !== false ||
+                            stripos($admin_result, 'failed') !== false) {
+                            $admin_message = "خطا: " . trim($admin_result);
+                            error_log("Error detected in result: $admin_message");
+                        } else {
+                            $admin_message = trim($admin_result);
+                        }
+                    } else {
+                        // If no output, treat as successful
+                        $admin_message = "دستور اجرا شد";
+                    }
                 }
 
                 // رفرش اطلاعات
@@ -1532,8 +2588,12 @@ function get_live_server_stats()
 {
     $stats = array();
 
-    // اطلاعات CPU
-    $cpu_usage = @shell_exec("top -bn1 | grep 'Cpu(s)' | awk '{print $2}' | cut -d'%' -f1");
+    // اطلاعات CPU - استفاده از دستور صحیح
+    $cpu_usage = @shell_exec("top -bn2 -d 0.5 | grep 'Cpu(s)' | tail -n 1 | awk '{print $2}' | sed 's/%us,//' | sed 's/us,//'");
+    if (empty($cpu_usage)) {
+        // روش جایگزین با استفاده از mpstat
+        $cpu_usage = @shell_exec("grep 'cpu ' /proc/stat | awk '{usage=(\$2+\$4)*100/(\$2+\$4+\$5)} END {print usage}'");
+    }
     $stats['cpu_usage'] = floatval(trim($cpu_usage)) ?: 0;
 
     // اطلاعات حافظه
@@ -2385,7 +3445,7 @@ function refreshChart() {
         <div class="card">
             <h2>🔍 بررسی وضعیت اتصال</h2>
             <form method="post">
-                <input type="text" name="pk" placeholder="کلید خصوصی خود را اینجا وارد کنید..." required>
+                <input type="text" name="pk" value="<?php echo isset($_POST['pk']) ? h($_POST['pk']) : ''; ?>" placeholder="کلید خصوصی خود را اینجا وارد کنید..." required>
                 <button type="submit">📊 بررسی وضعیت</button>
             </form>
             <div class="help">
@@ -2569,11 +3629,14 @@ function refreshChart() {
                                                 </td>
                                                 <td>
                                                     <div class="controls">
-                                                        <button type="button" onclick="showEditForm('<?php echo h($client['name']); ?>', <?php echo h($client['limit_gb']); ?>, <?php echo ($client['days_remaining'] === '∞' ? 0 : h($client['days_remaining'])); ?>)"
+                                                        <?php
+                                                        $client_name_escaped = str_replace("'", "\\'", $client['name']);
+                                                        ?>
+                                                        <button type="button" onclick="showEditForm('<?php echo $client_name_escaped; ?>', <?php echo h($client['limit_gb']); ?>, <?php echo ($client['days_remaining'] === '∞' ? 0 : h($client['days_remaining'])); ?>)"
                                                             class="btn-warning" style="width:auto;padding:8px 15px;margin:2px;">
                                                             ✏️ ویرایش
                                                         </button>
-                                                        <button type="button" onclick="if(confirm('آیا از حذف کاربر \"' + ' <?php echo h($client['name']); ?>' + '\" مطمئن هستید؟' )) sendAdminAction('remove-client', '<?php echo h($client['name']); ?>' )" class="btn-danger" style="width:auto;padding:8px 15px;margin:2px;">🗑️ حذف</button>
+                                                        <button type="button" onclick="if(confirm('آیا از حذف کاربر <?php echo $client_name_escaped; ?> مطمئن هستید؟')) sendAdminAction('remove-client', '<?php echo $client_name_escaped; ?>')" class="btn-danger" style="width:auto;padding:8px 15px;margin:2px;">🗑️ حذف</button>
                                                     </div>
                                                 </td>
                                             </tr>
@@ -2590,73 +3653,120 @@ function refreshChart() {
                         </div>
                     </div>
                     <!-- دکمه رفرش -->
-                    <form method="post">
+                    <form method="post" id="refreshForm">
                         <input type="hidden" name="pk" value="<?php echo h($_POST['pk']); ?>">
-                        <button type="submit" class="refresh-btn">🔄 بروزرسانی اطلاعات</button>
+                        <button type="button" onclick="refreshUserList(); return false;" class="refresh-btn">🔄 بروزرسانی اطلاعات</button>
                     </form>
                     <script>
                         // تابع رفرش خودکار لیست
                         function refreshUserList() {
-                            const pkInput = document.querySelector('input[name="pk"]');
-                            if (!pkInput) return; // nothing to refresh for non-admin view
+                            // resolve admin pk robustly
+                            let pkValue = (window.ADMIN_PK && window.ADMIN_PK.length) ? window.ADMIN_PK : '';
+                            if (!pkValue) {
+                                const allPk = Array.from(document.querySelectorAll('input[name="pk"]'));
+                                const filled = allPk.find(i => i && i.value && i.value.trim().length > 0);
+                                pkValue = filled ? filled.value.trim() : '';
+                            }
+                            if (!pkValue) return; // nothing to refresh for non-admin view
+
+                            // نمایش حالت بارگذاری
+                            const refreshBtn = document.querySelector('.refresh-btn');
+                            const originalText = refreshBtn ? refreshBtn.innerHTML : '';
+                            if (refreshBtn) {
+                                refreshBtn.innerHTML = '⏳ در حال بروزرسانی...';
+                                refreshBtn.disabled = true;
+                            }
 
                             fetch(window.location.href, {
                                     method: 'POST',
+                                    headers: {
+                                        'Content-Type': 'application/x-www-form-urlencoded',
+                                    },
                                     body: new URLSearchParams({
                                         'action': 'refresh',
-                                        'pk': pkInput.value
+                                        'pk': pkValue
                                     })
                                 })
-                                .then(response => response.text())
-                                .then(html => {
-                                    const parser = new DOMParser();
-                                    const doc = parser.parseFromString(html, 'text/html');
-                                    const newTable = doc.querySelector('#clientsTable tbody');
-                                    if (newTable) {
-                                        const tbody = document.querySelector('#clientsTable tbody');
-                                        if (tbody) tbody.innerHTML = newTable.innerHTML;
+                                .then(response => {
+                                    if (!response.ok) {
+                                        throw new Error('Network response was not ok');
                                     }
-                                }).catch(() => {
-                                    /* ignore network errors silently */
+                                    return response.text();
+                                })
+                                .then(html => {
+                                    const tbody = document.querySelector('#clientsTable tbody');
+                                    if (tbody && html.trim()) {
+                                        tbody.innerHTML = html;
+                                        if (refreshBtn) {
+                                            refreshBtn.innerHTML = '✅ بروزرسانی شد';
+                                            setTimeout(() => {
+                                                refreshBtn.innerHTML = originalText;
+                                                refreshBtn.disabled = false;
+                                            }, 1500);
+                                        }
+                                    }
+                                })
+                                .catch((error) => {
+                                    console.error('Error:', error);
+                                    if (refreshBtn) {
+                                        refreshBtn.innerHTML = '❌ خطا در بروزرسانی';
+                                        setTimeout(() => {
+                                            refreshBtn.innerHTML = originalText;
+                                            refreshBtn.disabled = false;
+                                        }, 2000);
+                                    }
                                 });
                         }
 
                         // ارسال عملیات مدیریتی به سرور (AJAX) برای حذف/ویرایش بدون لود کامل صفحه
                         function sendAdminAction(action, param1 = '', param2 = '', param3 = '') {
-                            const pkInput = document.querySelector('input[name="pk"]');
-                            if (!pkInput || !pkInput.value) {
+                            let pkValue = (window.ADMIN_PK && window.ADMIN_PK.length) ? window.ADMIN_PK : '';
+                            if (!pkValue) {
+                                const allPk = Array.from(document.querySelectorAll('input[name="pk"]'));
+                                const filled = allPk.find(i => i && i.value && i.value.trim().length > 0);
+                                pkValue = filled ? filled.value.trim() : '';
+                            }
+                            if (!pkValue) {
                                 alert('کلید خصوصی مدیر موجود نیست');
+                                console.error('Private key not found in page.');
                                 return;
                             }
 
+                            console.log('Sending admin action:', action, 'with pk:', pkValue.substring(0, 10) + '...');
+
                             const body = new URLSearchParams();
-                            body.append('pk', pkInput.value);
+                            body.append('pk', pkValue);
                             body.append('admin_action', action);
                             if (param1 !== '') body.append('param1', param1);
                             if (param2 !== '') body.append('param2', param2);
                             if (param3 !== '') body.append('param3', param3);
 
+                            console.log('Request body:', body.toString());
+
                             fetch(window.location.href, {
                                 method: 'POST',
-                                body: body
-                            }).then(() => {
-                                // بعد از انجام عملیات، tbody را رفرش کن
+                                headers: {
+                                    'Content-Type': 'application/x-www-form-urlencoded',
+                                },
+                                body: body.toString()
+                            }).then(response => {
+                                console.log('Response status:', response.status);
+                                if (!response.ok) {
+                                    throw new Error('خطا در ارسال درخواست - Status: ' + response.status);
+                                }
+                                return response.text();
+                            }).then(data => {
+                                console.log('Response received:', data.substring(0, 100));
+                                // بلافاصله بعد از حذف/ویرایش، لیست را رفرش کن
                                 refreshUserList();
-                            }).catch(() => {
-                                alert('خطا در ارسال درخواست مدیریتی');
+                            }).catch((error) => {
+                                console.error('Error:', error);
+                                alert('خطا در ارسال درخواست مدیریتی: ' + error.message);
                             });
                         }
 
                         // رفرش خودکار هر 30 ثانیه
                         setInterval(refreshUserList, 30000);
-
-                        // رفرش اولیه در لود صفحه
-                        document.addEventListener('DOMContentLoaded', () => {
-                            const refreshBtn = document.querySelector('.refresh-btn');
-                            if (refreshBtn) {
-                                refreshBtn.addEventListener('click', refreshUserList);
-                            }
-                        });
                     </script>
                     <!-- تنظیمات سرور -->
                     <div class="admin-section">
@@ -2815,6 +3925,7 @@ PersistentKeepalive = 25</pre>
             </div>
         <?php endif; ?>
     </div>
+    <script src="/assets/admin-debug-link.js"></script>
 </body>
 
 </html>
@@ -2905,6 +4016,7 @@ NGINX
     ok "Web panel installed successfully"
     echo -e "${GREEN}Web interface URL:${NC} http://$(public_ip)/"
 }
+
 verify_installation() {
     log "Verifying installation..."
     
@@ -3134,3 +4246,4 @@ case "${1:-}" in
         usage
         ;;
 esac
+
