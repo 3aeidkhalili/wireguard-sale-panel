@@ -1,10 +1,13 @@
                                                                 ##👑Demo Admin👑
 
-<img width="1920" height="3385" alt="image" src="https://github.com/user-attachments/assets/9b397f44-840e-4eab-b29f-7cc74ed65fa0" />
+<img width="1680" height="2360" alt="image" src="https://github.com/user-attachments/assets/1e12e0cc-05d4-4da7-9d43-83494e3a2126" />
 
                                                                  🤷‍♂️Demo User🤷‍♂️
 
-<img width="1920" height="2050" alt="image" src="https://github.com/user-attachments/assets/295148ec-fb89-44eb-9408-cd260418f25d" />
+<img width="1680" height="4343" alt="image" src="https://github.com/user-attachments/assets/31c822ed-7b37-4eea-9b99-050d168bb232" />
+
+                                                                  🚨debug system🚨
+<img width="1680" height="1989" alt="image" src="https://github.com/user-attachments/assets/2f5a3489-c7d8-418f-9c8b-efecac0bf1eb" />
 
 
 ## 🚀 نصب سریع پنل اصلی
