@@ -1325,6 +1325,20 @@ function getDiskUsage($path) {
         'icon' => $percent > 90 ? '🔴' : ($percent > 70 ? '🟡' : '🟢')
     ];
 }
+
+// Efficiently read the last N lines of a file (falls back to PHP slice if tail is unavailable)
+function tailFile($file, $lines = 100) {
+    $lines = max(1, (int)$lines);
+    if (!file_exists($file)) return '';
+    $cmd = "tail -n $lines " . escapeshellarg($file) . " 2>&1";
+    $out = @shell_exec($cmd);
+    if (is_string($out) && $out !== '') {
+        return $out;
+    }
+    $arr = @file($file);
+    if ($arr === false) return '';
+    return implode('', array_slice($arr, -$lines));
+}
 ?>
 <!DOCTYPE html>
 <html dir="rtl" lang="fa">
@@ -1332,158 +1346,787 @@ function getDiskUsage($path) {
     <meta charset="UTF-8">
     <title>🔍 WireGuard System Debug</title>
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <style>
-        * { margin: 0; padding: 0; box-sizing: border-box;font-family: 'vazir', Tahoma, sans-serif; }
+    <meta http-equiv="Content-Security-Policy" content="default-src 'self'; img-src 'self' data:; script-src 'self' 'unsafe-inline'; style-src 'self' 'unsafe-inline'; connect-src 'self';">
+ <style>
+    :root {
+        /* رنگ‌های اصلی */
+        --primary: #667eea;
+        --primary-dark: #5a6fd8;
+        --primary-light: #8a9cf0;
+        --secondary: #764ba2;
+        --accent: #f093fb;
+        --accent-secondary: #f5576c;
+        
+        /* رنگ‌های وضعیت */
+        --success: #10b981;
+        --success-light: #d1fae5;
+        --warning: #f59e0b;
+        --warning-light: #fef3c7;
+        --danger: #ef4444;
+        --danger-light: #fee2e2;
+        
+        /* رنگ‌های خنثی */
+        --dark: #1f2937;
+        --dark-light: #374151;
+        --gray: #6b7280;
+        --gray-light: #9ca3af;
+        --light: #f8fafc;
+        --white: #ffffff;
+        
+        /* سایه‌ها */
+        --shadow-sm: 0 1px 2px 0 rgba(0, 0, 0, 0.05);
+        --shadow-md: 0 4px 6px -1px rgba(0, 0, 0, 0.1), 0 2px 4px -1px rgba(0, 0, 0, 0.06);
+        --shadow-lg: 0 10px 15px -3px rgba(0, 0, 0, 0.1), 0 4px 6px -2px rgba(0, 0, 0, 0.05);
+        --shadow-xl: 0 20px 25px -5px rgba(0, 0, 0, 0.1), 0 10px 10px -5px rgba(0, 0, 0, 0.04);
+        
+        /* انیمیشن‌ها */
+        --transition-fast: 0.15s ease-in-out;
+        --transition-normal: 0.3s ease-in-out;
+        --transition-slow: 0.5s ease-in-out;
+        
+        /* border-radius */
+        --radius-sm: 8px;
+        --radius-md: 12px;
+        --radius-lg: 16px;
+        --radius-xl: 20px;
+        
+        /* تایپوگرافی */
+        --font-size-xs: 0.75rem;
+        --font-size-sm: 0.875rem;
+        --font-size-base: 1rem;
+        --font-size-lg: 1.125rem;
+        --font-size-xl: 1.25rem;
+        --font-size-2xl: 1.5rem;
+        --font-size-3xl: 1.875rem;
+        --font-size-4xl: 2.25rem;
+        
+        /* spacing */
+        --space-1: 0.25rem;
+        --space-2: 0.5rem;
+        --space-3: 0.75rem;
+        --space-4: 1rem;
+        --space-5: 1.25rem;
+        --space-6: 1.5rem;
+        --space-8: 2rem;
+        --space-10: 2.5rem;
+        --space-12: 3rem;
+    }
+
+    * {
+        margin: 0;
+        padding: 0;
+        box-sizing: border-box;
+    }
+
+    body {
+        font-family: 'Vazir', Tahoma, sans-serif;
+        background: linear-gradient(135deg, var(--primary) 0%, var(--secondary) 100%);
+        background-attachment: fixed;
+        padding: var(--space-6);
+        color: var(--dark);
+        line-height: 1.6;
+        min-height: 100vh;
+    }
+
+    .container {
+        max-width: 1400px;
+        margin: 0 auto;
+    }
+
+    /* Header Styles */
+    .header {
+        background: var(--white);
+        padding: var(--space-10) var(--space-8);
+        border-radius: var(--radius-xl);
+        box-shadow: var(--shadow-xl);
+        margin-bottom: var(--space-8);
+        text-align: center;
+        position: relative;
+        overflow: hidden;
+        backdrop-filter: blur(10px);
+        border: 1px solid rgba(255, 255, 255, 0.2);
+    }
+
+    .header::before {
+        content: '';
+        position: absolute;
+        top: 0;
+        left: 0;
+        right: 0;
+        height: 4px;
+        background: linear-gradient(90deg, var(--primary), var(--secondary), var(--accent));
+        background-size: 200% 100%;
+        animation: gradientShift 3s ease infinite;
+    }
+
+    .header h1 {
+        color: var(--primary);
+        font-size: var(--font-size-4xl);
+        margin-bottom: var(--space-4);
+        font-weight: 700;
+        display: flex;
+        align-items: center;
+        justify-content: center;
+        gap: var(--space-4);
+        text-shadow: 0 2px 4px rgba(0, 0, 0, 0.1);
+    }
+
+    .header-subtitle {
+        color: var(--gray);
+        font-size: var(--font-size-lg);
+        margin-bottom: var(--space-6);
+    }
+
+    .header-actions {
+        display: flex;
+        gap: var(--space-4);
+        justify-content: center;
+        align-items: center;
+        flex-wrap: wrap;
+        margin-top: var(--space-6);
+    }
+
+    /* Card Styles */
+    .card {
+        background: var(--white);
+        border-radius: var(--radius-lg);
+        padding: var(--space-8);
+        box-shadow: var(--shadow-lg);
+        transition: all var(--transition-normal);
+        height: 100%;
+        display: flex;
+        flex-direction: column;
+        border: 1px solid rgba(255, 255, 255, 0.1);
+        backdrop-filter: blur(10px);
+        position: relative;
+        overflow: hidden;
+    }
+
+    .card::before {
+        content: '';
+        position: absolute;
+        top: 0;
+        left: 0;
+        right: 0;
+        height: 3px;
+        background: linear-gradient(90deg, var(--primary), var(--secondary));
+        transform: scaleX(0);
+        transform-origin: left;
+        transition: transform var(--transition-normal);
+    }
+
+    .card:hover {
+        transform: translateY(-8px);
+        box-shadow: var(--shadow-xl);
+    }
+
+    .card:hover::before {
+        transform: scaleX(1);
+    }
+
+    .card-header {
+        display: flex;
+        align-items: center;
+        gap: var(--space-4);
+        margin-bottom: var(--space-6);
+        padding-bottom: var(--space-4);
+        border-bottom: 2px solid var(--primary);
+        position: relative;
+    }
+
+    .card-header::after {
+        content: '';
+        position: absolute;
+        bottom: -2px;
+        left: 0;
+        width: 60px;
+        height: 2px;
+        background: var(--accent);
+        transition: width var(--transition-normal);
+    }
+
+    .card:hover .card-header::after {
+        width: 100px;
+    }
+
+    .card-header h2 {
+        color: var(--primary);
+        font-size: var(--font-size-2xl);
+        margin: 0;
+        font-weight: 600;
+    }
+
+    .card-header-icon {
+        font-size: var(--font-size-2xl);
+        color: var(--primary);
+        display: flex;
+        align-items: center;
+        justify-content: center;
+        width: 48px;
+        height: 48px;
+        background: linear-gradient(135deg, var(--primary-light), var(--primary));
+        border-radius: var(--radius-md);
+        color: white;
+    }
+
+    /* Grid Layout */
+    .grid {
+        display: grid;
+        grid-template-columns: repeat(auto-fit, minmax(380px, 1fr));
+        gap: var(--space-6);
+        margin-bottom: var(--space-8);
+    }
+
+    .full-width {
+        grid-column: 1 / -1;
+    }
+
+    /* Status Items */
+    .status-list {
+        display: flex;
+        flex-direction: column;
+        gap: var(--space-3);
+    }
+
+    .status-item {
+        display: flex;
+        justify-content: space-between;
+        align-items: center;
+        padding: var(--space-4) var(--space-5);
+        border-radius: var(--radius-md);
+        border-right: 4px solid var(--primary);
+        background: var(--light);
+        transition: all var(--transition-fast);
+        position: relative;
+        overflow: hidden;
+    }
+
+    .status-item::before {
+        content: '';
+        position: absolute;
+        top: 0;
+        left: -100%;
+        width: 100%;
+        height: 100%;
+        background: linear-gradient(90deg, transparent, rgba(255, 255, 255, 0.4), transparent);
+        transition: left var(--transition-slow);
+    }
+
+    .status-item:hover::before {
+        left: 100%;
+    }
+
+    .status-item:hover {
+        background: #f1f5f9;
+        transform: translateX(4px);
+    }
+
+    .status-item.success {
+        border-right-color: var(--success);
+        background: var(--success-light);
+    }
+
+    .status-item.warning {
+        border-right-color: var(--warning);
+        background: var(--warning-light);
+    }
+
+    .status-item.error {
+        border-right-color: var(--danger);
+        background: var(--danger-light);
+    }
+
+    .status-label {
+        font-weight: 600;
+        color: var(--dark);
+        display: flex;
+        align-items: center;
+        gap: var(--space-3);
+        font-size: var(--font-size-sm);
+    }
+
+    .status-value {
+        font-family: 'Courier New', monospace, 'Vazir';
+        color: var(--primary);
+        font-weight: 700;
+        font-size: var(--font-size-sm);
+        direction: ltr;
+    }
+
+    /* Progress Bar */
+    .progress-container {
+        margin-top: var(--space-4);
+    }
+
+    .progress-info {
+        display: flex;
+        justify-content: space-between;
+        margin-bottom: var(--space-2);
+        font-size: var(--font-size-sm);
+        color: var(--gray);
+    }
+
+    .progress-bar {
+        background: #e2e8f0;
+        border-radius: var(--radius-lg);
+        height: 28px;
+        overflow: hidden;
+        position: relative;
+        box-shadow: inset 0 1px 3px rgba(0, 0, 0, 0.1);
+    }
+
+    .progress-fill {
+        height: 100%;
+        background: linear-gradient(90deg, var(--success), #059669);
+        display: flex;
+        align-items: center;
+        justify-content: center;
+        color: white;
+        font-weight: 700;
+        font-size: var(--font-size-sm);
+        transition: width 0.8s cubic-bezier(0.34, 1.56, 0.64, 1);
+        position: relative;
+        overflow: hidden;
+    }
+
+    .progress-fill::after {
+        content: '';
+        position: absolute;
+        top: 0;
+        left: -100%;
+        width: 100%;
+        height: 100%;
+        background: linear-gradient(90deg, transparent, rgba(255, 255, 255, 0.3), transparent);
+        animation: shimmer 2s infinite;
+    }
+
+    .progress-fill.warning {
+        background: linear-gradient(90deg, var(--warning), #d97706);
+    }
+
+    .progress-fill.danger {
+        background: linear-gradient(90deg, var(--danger), #dc2626);
+    }
+
+    /* Log Box */
+    .log-box {
+        background: #1e1e1e;
+        color: #4ade80;
+        padding: var(--space-6);
+        border-radius: var(--radius-md);
+        font-family: 'Fira Code', 'Courier New', monospace;
+        font-size: var(--font-size-sm);
+        max-height: 500px;
+        overflow-y: auto;
+        white-space: pre-wrap;
+        word-wrap: break-word;
+        direction: ltr;
+        text-align: left;
+        flex-grow: 1;
+        border: 1px solid #374151;
+        box-shadow: inset 0 2px 10px rgba(0, 0, 0, 0.3);
+        line-height: 1.5;
+    }
+
+    /* Accordion (details/summary) styling */
+    details.card {
+        padding: 0;
+        overflow: hidden;
+    }
+    details.card > summary {
+        display: flex;
+        align-items: center;
+        justify-content: space-between;
+        padding: var(--space-5) var(--space-6);
+        font-weight: 700;
+        color: var(--primary);
+        background: var(--white);
+        cursor: pointer;
+        list-style: none;
+        outline: none;
+        border-bottom: 1px solid #e5e7eb;
+        transition: background var(--transition-normal), color var(--transition-normal);
+        position: relative;
+    }
+    details.card > summary::-webkit-details-marker { display: none; }
+    details.card > summary::after {
+        content: '▸';
+        color: var(--primary);
+        font-size: var(--font-size-lg);
+        transform: translateX(4px) rotate(0deg);
+        transition: transform var(--transition-normal);
+    }
+    details.card[open] > summary {
+        background: #f8fafc;
+        color: var(--dark);
+    }
+    details.card[open] > summary::after {
+        transform: translateX(4px) rotate(90deg);
+    }
+    details.card .log-box {
+        border-radius: 0 0 var(--radius-lg) var(--radius-lg);
+        margin: 0;
+    }
+    .timestamp {
+        color: #e5e7eb;
+        text-align: center;
+        margin-top: var(--space-6);
+        font-size: var(--font-size-sm);
+    }
+
+    .log-box::-webkit-scrollbar {
+        width: 12px;
+    }
+
+    .log-box::-webkit-scrollbar-track {
+        background: #2d3748;
+        border-radius: 0 var(--radius-md) var(--radius-md) 0;
+    }
+
+    .log-box::-webkit-scrollbar-thumb {
+        background: var(--primary);
+        border-radius: var(--radius-md);
+        border: 2px solid #2d3748;
+    }
+
+    .log-box::-webkit-scrollbar-thumb:hover {
+        background: var(--primary-dark);
+    }
+
+    /* Button Styles */
+    .btn {
+        display: inline-flex;
+        align-items: center;
+        gap: var(--space-3);
+        padding: var(--space-4) var(--space-6);
+        border-radius: var(--radius-md);
+        font-weight: 600;
+        cursor: pointer;
+        transition: all var(--transition-normal);
+        border: none;
+        text-decoration: none;
+        font-size: var(--font-size-base);
+        position: relative;
+        overflow: hidden;
+    }
+
+    .btn::before {
+        content: '';
+        position: absolute;
+        top: 0;
+        left: -100%;
+        width: 100%;
+        height: 100%;
+        background: linear-gradient(90deg, transparent, rgba(255, 255, 255, 0.2), transparent);
+        transition: left var(--transition-slow);
+    }
+
+    .btn:hover::before {
+        left: 100%;
+    }
+
+    .btn-primary {
+        background: linear-gradient(135deg, var(--primary), var(--secondary));
+        color: var(--white);
+        box-shadow: var(--shadow-md);
+    }
+
+    .btn-primary:hover {
+        transform: translateY(-2px);
+        box-shadow: var(--shadow-lg);
+        background: linear-gradient(135deg, var(--primary-dark), var(--secondary));
+    }
+
+    .btn-outline {
+        background: transparent;
+        color: var(--primary);
+        border: 2px solid var(--primary);
+    }
+
+    .btn-outline:hover {
+        background: var(--primary);
+        color: var(--white);
+        transform: translateY(-2px);
+        box-shadow: var(--shadow-md);
+    }
+
+    /* Toggle Switch */
+    .toggle-container {
+        display: flex;
+        align-items: center;
+        gap: var(--space-3);
+        background: var(--light);
+        padding: var(--space-4) var(--space-5);
+        border-radius: var(--radius-md);
+        box-shadow: var(--shadow-sm);
+        transition: all var(--transition-normal);
+        border: 1px solid #e2e8f0;
+    }
+
+    .toggle-container:hover {
+        box-shadow: var(--shadow-md);
+        transform: translateY(-1px);
+    }
+
+    .toggle-switch {
+        position: relative;
+        display: inline-block;
+        width: 52px;
+        height: 28px;
+    }
+
+    .toggle-switch input {
+        opacity: 0;
+        width: 0;
+        height: 0;
+    }
+
+    .toggle-slider {
+        position: absolute;
+        cursor: pointer;
+        top: 0;
+        left: 0;
+        right: 0;
+        bottom: 0;
+        background-color: var(--gray-light);
+        transition: var(--transition-normal);
+        border-radius: 34px;
+    }
+
+    .toggle-slider:before {
+        position: absolute;
+        content: "";
+        height: 20px;
+        width: 20px;
+        left: 4px;
+        bottom: 4px;
+        background-color: white;
+        transition: var(--transition-normal);
+        border-radius: 50%;
+        box-shadow: var(--shadow-sm);
+    }
+
+    input:checked + .toggle-slider {
+        background-color: var(--primary);
+    }
+
+    input:checked + .toggle-slider:before {
+        transform: translateX(24px);
+    }
+
+    /* Footer */
+    .footer {
+        text-align: center;
+        color: var(--white);
+        margin: var(--space-10) 0 var(--space-6);
+        font-size: var(--font-size-lg);
+        display: flex;
+        justify-content: center;
+        align-items: center;
+        gap: var(--space-3);
+        text-shadow: 0 1px 2px rgba(0, 0, 0, 0.1);
+    }
+
+    /* Health Indicator */
+    .health-indicator {
+        display: flex;
+        align-items: center;
+        gap: var(--space-4);
+        padding: var(--space-4) var(--space-5);
+        border-radius: var(--radius-md);
+        background: var(--white);
+        box-shadow: var(--shadow-md);
+        margin-bottom: var(--space-6);
+        border-left: 4px solid var(--success);
+        transition: all var(--transition-normal);
+    }
+
+    .health-indicator.warning {
+        border-left-color: var(--warning);
+    }
+
+    .health-indicator.critical {
+        border-left-color: var(--danger);
+    }
+
+    .health-indicator:hover {
+        transform: translateX(4px);
+        box-shadow: var(--shadow-lg);
+    }
+
+    .health-dot {
+        width: 12px;
+        height: 12px;
+        border-radius: 50%;
+        animation: pulse 2s infinite;
+    }
+
+    .health-good {
+        background: var(--success);
+    }
+
+    .health-warning {
+        background: var(--warning);
+    }
+
+    .health-critical {
+        background: var(--danger);
+    }
+
+    /* Animations */
+    @keyframes pulse {
+        0% {
+            transform: scale(0.95);
+            box-shadow: 0 0 0 0 rgba(16, 185, 129, 0.7);
+        }
+        70% {
+            transform: scale(1);
+            box-shadow: 0 0 0 10px rgba(16, 185, 129, 0);
+        }
+        100% {
+            transform: scale(0.95);
+            box-shadow: 0 0 0 0 rgba(16, 185, 129, 0);
+        }
+    }
+
+    @keyframes gradientShift {
+        0% {
+            background-position: 0% 50%;
+        }
+        50% {
+            background-position: 100% 50%;
+        }
+        100% {
+            background-position: 0% 50%;
+        }
+    }
+
+    @keyframes shimmer {
+        0% {
+            transform: translateX(-100%);
+        }
+        100% {
+            transform: translateX(400%);
+        }
+    }
+
+    /* Responsive Design */
+    @media (max-width: 768px) {
         body {
-            font-family: 'vazir', Tahoma, sans-serif;
-            background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
-            padding: 20px;
-            color: #333;
+            padding: var(--space-4);
         }
-        .container {
-            max-width: 1400px;
-            margin: 0 auto;
-        }
-        .header {
-            background: white;
-            padding: 30px;
-            border-radius: 15px;
-            box-shadow: 0 10px 30px rgba(0,0,0,0.2);
-            margin-bottom: 20px;
-            text-align: center;
-        }
-        .header h1 {
-            color: #667eea;
-            font-size: 2.5em;
-            margin-bottom: 10px;
-        }
+        
         .grid {
-            display: grid;
-            grid-template-columns: repeat(auto-fit, minmax(350px, 1fr));
-            gap: 20px;
-            margin-bottom: 20px;
+            grid-template-columns: 1fr;
+            gap: var(--space-4);
         }
+        
+        .header {
+            padding: var(--space-6) var(--space-4);
+        }
+        
+        .header h1 {
+            font-size: var(--font-size-3xl);
+            flex-direction: column;
+            gap: var(--space-3);
+        }
+        
+        .header-actions {
+            flex-direction: column;
+            align-items: stretch;
+        }
+        
         .card {
-            background: white;
-            border-radius: 15px;
-            padding: 25px;
-            box-shadow: 0 10px 30px rgba(0,0,0,0.15);
+            padding: var(--space-6);
         }
-        .card h2 {
-            color: #667eea;
-            margin-bottom: 20px;
-            padding-bottom: 10px;
-            border-bottom: 3px solid #667eea;
-            font-size: 1.5em;
-        }
-        .status-item {
-            display: flex;
-            justify-content: space-between;
-            align-items: center;
-            padding: 12px;
-            margin: 8px 0;
-            background: #f7f9fc;
-            border-radius: 8px;
-            border-right: 4px solid #667eea;
-        }
-        .status-item.error {
-            border-right-color: #e74c3c;
-            background: #fee;
-        }
-        .status-item.warning {
-            border-right-color: #f39c12;
-            background: #fffaf0;
-        }
-        .status-item.success {
-            border-right-color: #2ecc71;
-            background: #f0fff4;
-        }
-        .label {
-            font-weight: 600;
-            color: #555;
-        }
-        .value {
-            font-family: 'Courier New', monospace;
-            color: #667eea;
-            font-weight: bold;
-        }
-        .log-box {
-            background: #1e1e1e;
-            color: #0f0;
-            padding: 20px;
-            border-radius: 10px;
-            font-family: 'Courier New', monospace;
-            font-size: 0.9em;
-            max-height: 500px;
-            overflow-y: auto;
-            white-space: pre-wrap;
-            word-wrap: break-word;
-            direction: ltr;
-            text-align: left;
-        }
-        .log-box::-webkit-scrollbar {
-            width: 10px;
-        }
-        .log-box::-webkit-scrollbar-track {
-            background: #2e2e2e;
-        }
-        .log-box::-webkit-scrollbar-thumb {
-            background: #667eea;
-            border-radius: 5px;
-        }
-        .progress-bar {
-            background: #e0e0e0;
-            border-radius: 10px;
-            height: 25px;
-            overflow: hidden;
-            margin-top: 8px;
-        }
-        .progress-fill {
-            height: 100%;
-            background: linear-gradient(90deg, #2ecc71, #27ae60);
-            display: flex;
-            align-items: center;
-            justify-content: center;
-            color: white;
-            font-weight: bold;
-            font-size: 0.85em;
-            transition: width 0.3s ease;
-        }
-        .progress-fill.warning {
-            background: linear-gradient(90deg, #f39c12, #e67e22);
-        }
-        .progress-fill.danger {
-            background: linear-gradient(90deg, #e74c3c, #c0392b);
-        }
-        .refresh-btn {
-            background: linear-gradient(135deg, #667eea, #764ba2);
-            color: white;
-            border: none;
-            padding: 15px 30px;
-            border-radius: 10px;
-            font-size: 1.1em;
-            cursor: pointer;
-            box-shadow: 0 5px 15px rgba(0,0,0,0.2);
-            transition: transform 0.2s;
-        }
-        .refresh-btn:hover {
-            transform: translateY(-2px);
-            box-shadow: 0 7px 20px rgba(0,0,0,0.3);
-        }
-        .timestamp {
+        
+        .card-header {
+            flex-direction: column;
             text-align: center;
-            color: white;
-            margin: 20px 0;
-            font-size: 1.1em;
+            gap: var(--space-3);
         }
-    </style>
+        
+        .card-header::after {
+            left: 50%;
+            transform: translateX(-50%);
+        }
+        
+        .status-item {
+            flex-direction: column;
+            align-items: flex-start;
+            gap: var(--space-2);
+        }
+        
+        .btn {
+            width: 100%;
+            justify-content: center;
+        }
+    }
+
+    @media (max-width: 480px) {
+        :root {
+            --font-size-4xl: 1.75rem;
+            --font-size-3xl: 1.5rem;
+            --font-size-2xl: 1.25rem;
+        }
+        
+        .header h1 {
+            font-size: var(--font-size-2xl);
+        }
+        
+        .card {
+            padding: var(--space-4);
+        }
+    }
+
+    /* Utility Classes */
+    .text-center {
+        text-align: center;
+    }
+    
+    .text-right {
+        text-align: right;
+    }
+    
+    .mb-4 {
+        margin-bottom: var(--space-4);
+    }
+    
+    .mt-4 {
+        margin-top: var(--space-4);
+    }
+    
+    .p-4 {
+        padding: var(--space-4);
+    }
+    
+    .hidden {
+        display: none;
+    }
+    
+    .fade-in {
+        animation: fadeIn 0.5s ease-in-out;
+    }
+    
+    @keyframes fadeIn {
+        from {
+            opacity: 0;
+            transform: translateY(20px);
+        }
+        to {
+            opacity: 1;
+            transform: translateY(0);
+        }
+    }
+</style>
 </head>
 <body>
 <div class="container">
     <div class="header">
         <h1>🔍 WireGuard System Diagnostics</h1>
         <p style="color: #666; margin-top: 10px;">آخرین بروزرسانی: <?php echo date('Y-m-d H:i:s'); ?></p>
-        <button class="refresh-btn" onclick="location.reload()">🔄 بروزرسانی</button>
+        <div style="display:flex;gap:10px;justify-content:center;align-items:center;flex-wrap:wrap;">
+        </div>
     </div>
 
     <div class="grid">
@@ -1657,67 +2300,64 @@ function getDiskUsage($path) {
     </div>
 
     <!-- Deletion Log -->
-    <div class="card" style="grid-column: 1 / -1;">
-        <h2>🗑️ لاگ حذف کاربران (آخرین 100 خط)</h2>
+    <details class="card" style="grid-column: 1 / -1;">
+        <summary>🗑️ لاگ حذف کاربران (کلیک برای نمایش)</summary>
         <div class="log-box">
 <?php
 if (file_exists('/tmp/wireguard_delete.log')) {
-    $lines = file('/tmp/wireguard_delete.log');
-    $last_lines = array_slice($lines, -100);
-    echo htmlspecialchars(implode('', $last_lines));
+    $tail = tailFile('/tmp/wireguard_delete.log', 100);
+    echo htmlspecialchars($tail ?? '');
 } else {
     echo "📝 هیچ لاگ حذفی موجود نیست.";
 }
 ?>
         </div>
-    </div>
+    </details>
 
     <!-- Add Client Log -->
-    <div class="card" style="grid-column: 1 / -1;">
-        <h2>➕ لاگ افزودن کاربران (آخرین 100 خط)</h2>
+    <details class="card" style="grid-column: 1 / -1;">
+        <summary>➕ لاگ افزودن کاربران (کلیک برای نمایش)</summary>
         <div class="log-box">
 <?php
 if (file_exists('/tmp/wireguard_add.log')) {
-    $lines = file('/tmp/wireguard_add.log');
-    $last_lines = array_slice($lines, -100);
-    echo htmlspecialchars(implode('', $last_lines));
+    $tail = tailFile('/tmp/wireguard_add.log', 100);
+    echo htmlspecialchars($tail ?? '');
 } else {
     echo "📝 هنوز کاربری افزوده نشده است.";
 }
 ?>
         </div>
-    </div>
+    </details>
 
     <!-- Edit Client Log -->
-    <div class="card" style="grid-column: 1 / -1;">
-        <h2>✏️ لاگ ویرایش کاربران (آخرین 100 خط)</h2>
+    <details class="card" style="grid-column: 1 / -1;">
+        <summary>✏️ لاگ ویرایش کاربران (کلیک برای نمایش)</summary>
         <div class="log-box">
 <?php
 if (file_exists('/tmp/wireguard_edit.log')) {
-    $lines = file('/tmp/wireguard_edit.log');
-    $last_lines = array_slice($lines, -100);
-    echo htmlspecialchars(implode('', $last_lines));
+    $tail = tailFile('/tmp/wireguard_edit.log', 100);
+    echo htmlspecialchars($tail ?? '');
 } else {
     echo "📝 هنوز ویرایشی ثبت نشده است.";
 }
 ?>
         </div>
-    </div>
+    </details>
 
     <!-- WireGuard Interface Details -->
-    <div class="card" style="grid-column: 1 / -1;">
-        <h2>🔧 جزئیات WireGuard Interface</h2>
+    <details class="card" style="grid-column: 1 / -1;">
+        <summary>🔧 جزئیات WireGuard Interface (کلیک برای نمایش)</summary>
         <div class="log-box">
 <?php
 $wg_output = shell_exec("wg show wg0 2>&1");
 echo htmlspecialchars($wg_output ?: "⚠️ Unable to retrieve WireGuard interface details");
 ?>
         </div>
-    </div>
+    </details>
 
     <!-- Active Clients List -->
-    <div class="card" style="grid-column: 1 / -1;">
-        <h2>👥 لیست کاربران فعال</h2>
+    <details class="card" style="grid-column: 1 / -1;">
+        <summary>👥 لیست کاربران فعال (کلیک برای نمایش)</summary>
         <div class="log-box">
 <?php
 if (file_exists('/etc/wireguard/clients.db')) {
@@ -1728,7 +2368,9 @@ if (file_exists('/etc/wireguard/clients.db')) {
         } else if (trim($line) !== '') {
             $parts = explode('|', $line);
             if (count($parts) >= 4) {
-                echo "👤 " . ($parts[0] ?? 'unknown') . " → " . ($parts[3] ?? 'no-ip') . "\n";
+                echo "👤 " . htmlspecialchars($parts[0] ?? 'unknown') . " → " . htmlspecialchars($parts[3] ?? 'no-ip') . "\n";
+            } else if (count($parts) >= 1) {
+                echo "👤 " . htmlspecialchars($parts[0] ?? 'unknown') . "\n";
             }
         }
     }
@@ -1737,230 +2379,55 @@ if (file_exists('/etc/wireguard/clients.db')) {
 }
 ?>
         </div>
-    </div>
+    </details>
 
-    <!-- Weekly Usage Chart -->
-    <div class="card" style="grid-column: 1 / -1;">
-        <h2>📈 نمودار مصرف هفتگی کاربر</h2>
-        <?php
-        // Build users list from clients.db
-        $users = [];
-        if (file_exists('/etc/wireguard/clients.db')) {
-            foreach (file('/etc/wireguard/clients.db', FILE_IGNORE_NEW_LINES | FILE_SKIP_EMPTY_LINES) as $l) {
-                if (strpos($l, '#') === 0) continue;
-                $p = explode('|', $l);
-                if (count($p) >= 1 && trim($p[0]) !== '') $users[] = trim($p[0]);
-            }
-        }
-        $users = array_unique($users);
-        $user = $_GET['user'] ?? ($users[0] ?? '');
-        $dates = [];
-        for ($i = 6; $i >= 0; $i--) { $dates[] = date('Y-m-d', strtotime("-$i day")); }
-        $vals = [];
-        foreach ($dates as $d) {
-            $f = "/etc/wireguard/usage/$d.csv";
-            $val = 0.0;
-            if (file_exists($f)) {
-                $lines = file($f, FILE_IGNORE_NEW_LINES | FILE_SKIP_EMPTY_LINES);
-                foreach ($lines as $ln) {
-                    $pp = explode('|', $ln);
-                    if (count($pp) >= 2 && $pp[0] === $user) { $val = floatval($pp[1]); break; }
-                }
-            }
-            // convert to MB
-            $vals[] = round($val / 1024 / 1024, 2);
-        }
-        ?>
-        <div style="margin-bottom:12px;">
-            <form method="get" style="display:flex;gap:10px;align-items:center;">
-                <input type="hidden" name="token" value="<?php echo htmlspecialchars($token ?? '', ENT_QUOTES, 'UTF-8'); ?>">
-                <label for="user">کاربر:</label>
-                <select name="user" id="user" onchange="this.form.submit()">
-                    <?php foreach ($users as $u): ?>
-                        <option value="<?php echo htmlspecialchars($u, ENT_QUOTES, 'UTF-8'); ?>" <?php echo ($u === $user ? 'selected' : ''); ?>><?php echo htmlspecialchars($u); ?></option>
-                    <?php endforeach; ?>
-                </select>
-            </form>
-        </div>
-        <canvas id="usageChart" height="110"></canvas>
-        <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
-        <script>
-        (function(){
-            var ctx = document.getElementById('usageChart').getContext('2d');
-            var labels = <?php echo json_encode($dates); ?>;
-            var data = <?php echo json_encode($vals); ?>;
-            new Chart(ctx, {
-                type: 'line',
-                data: { labels: labels, datasets: [{ label: 'مصرف روزانه (MB) - <?php echo htmlspecialchars($user); ?>', data: data, borderColor: '#667eea', backgroundColor: 'rgba(102,126,234,0.2)', tension: 0.25 }] },
-                options: { scales: { y: { beginAtZero: true } }, plugins: { legend: { display: true } } }
-            });
-        })();
-        </script>
-    </div>
+    <!-- بخش مصرف/نمودار حذف شد بنا به درخواست -->
 
     <div class="timestamp">
         ⚡ Generated in <?php echo round((microtime(true) - $_SERVER['REQUEST_TIME_FLOAT']) * 1000, 2); ?> ms
     </div>
-</div>
+    </div>
 
-                    <!-- System Status Section -->
-                    <div class="admin-section">
-                        <h3>📊 وضعیت سیستم</h3>
-                        <?php
-                        // System diagnostics
-                        function getSysStatus($condition, $okText, $errorText) {
-                            return $condition ? "✅ $okText" : "❌ $errorText";
-                        }
-                        
-                        function getServiceStat($service) {
-                            $output = @shell_exec("systemctl is-active $service 2>&1");
-                            return trim($output) === 'active';
-                        }
-                        
-                        // Check critical components
-                        $wg_active = getServiceStat('wg-quick@wg0');
-                        $nginx_active = getServiceStat('nginx');
-                        $php_active = getServiceStat('php8.1-fpm') || getServiceStat('php8.0-fpm') || getServiceStat('php7.4-fpm');
-                        $etc_db_exists = file_exists('/etc/wireguard/clients.db');
-                        $web_db_exists = file_exists('/var/www/wireguard/db/clients.db');
-                        $scripts_ok = file_exists('/usr/local/bin/wg-admin') && is_executable('/usr/local/bin/wg-admin');
-                        
-                        // Calculate overall health
-                        $health_score = 0;
-                        $total_checks = 6;
-                        if ($wg_active) $health_score++;
-                        if ($nginx_active) $health_score++;
-                        if ($php_active) $health_score++;
-                        if ($etc_db_exists) $health_score++;
-                        if ($web_db_exists) $health_score++;
-                        if ($scripts_ok) $health_score++;
-                        
-                        $health_percent = round(($health_score / $total_checks) * 100);
-                        $health_color = $health_percent >= 80 ? '#2ecc71' : ($health_percent >= 50 ? '#f39c12' : '#e74c3c');
-                        $health_emoji = $health_percent >= 80 ? '🟢' : ($health_percent >= 50 ? '🟡' : '🔴');
-                        
-                        // Get system info
-                        $load = @sys_getloadavg();
-                        $uptime = @shell_exec("uptime -p");
-                        $wg_peers = substr_count(@shell_exec("wg show wg0 2>&1") ?: '', 'peer:');
-                        $disk_free = @disk_free_space('/');
-                        $disk_total = @disk_total_space('/');
-                        $disk_percent = $disk_total > 0 ? round((($disk_total - $disk_free) / $disk_total) * 100) : 0;
-                        ?>
-                        
-                        <div style="display:grid;grid-template-columns:1fr 1fr 1fr;gap:15px;margin-bottom:20px">
-                            <!-- Overall Health -->
-                            <div class="card" style="padding:20px;text-align:center;background:linear-gradient(135deg, <?php echo $health_color; ?>, <?php echo $health_color; ?>dd)">
-                                <div style="font-size:3em;margin-bottom:10px"><?php echo $health_emoji; ?></div>
-                                <h4 style="color:white;margin:10px 0">سلامت کلی سیستم</h4>
-                                <div style="font-size:2.5em;color:white;font-weight:bold"><?php echo $health_percent; ?>%</div>
-                                <div style="color:rgba(255,255,255,0.9);margin-top:8px">
-                                    <?php echo $health_score; ?> از <?php echo $total_checks; ?> مورد سالم
-                                </div>
-                            </div>
-                            
-                            <!-- Active Users -->
-                            <div class="card" style="padding:20px;text-align:center;background:linear-gradient(135deg, #667eea, #764ba2)">
-                                <div style="font-size:3em;margin-bottom:10px">👥</div>
-                                <h4 style="color:white;margin:10px 0">کاربران متصل</h4>
-                                <div style="font-size:2.5em;color:white;font-weight:bold"><?php echo $wg_peers; ?></div>
-                                <div style="color:rgba(255,255,255,0.9);margin-top:8px">
-                                    Peer<?php echo $wg_peers != 1 ? 's' : ''; ?> فعال
-                                </div>
-                            </div>
-                            
-                            <!-- System Load -->
-                            <div class="card" style="padding:20px;text-align:center;background:linear-gradient(135deg, #f093fb, #f5576c)">
-                                <div style="font-size:3em;margin-bottom:10px">⚡</div>
-                                <h4 style="color:white;margin:10px 0">بار سیستم</h4>
-                                <div style="font-size:2.5em;color:white;font-weight:bold"><?php echo $load ? round($load[0], 2) : 'N/A'; ?></div>
-                                <div style="color:rgba(255,255,255,0.9);margin-top:8px">
-                                    میانگین 1 دقیقه
-                                </div>
-                            </div>
-                        </div>
+    <script>
+    // Auto refresh toggle logic (30s)
+    (function(){
+        var key = 'wg_debug_auto_refresh';
+        var cb = document.getElementById('autoRefreshToggle');
+        if (cb) {
+            try { if (localStorage.getItem(key) === '1') { cb.checked = true; } } catch(e){}
+            var timer = null;
+            function arm(){
+                if (timer) clearInterval(timer);
+                if (cb.checked) timer = setInterval(function(){ location.reload(); }, 30000);
+            }
+            cb.addEventListener('change', function(){
+                try { localStorage.setItem(key, cb.checked ? '1' : '0'); } catch(e){}
+                arm();
+            });
+            arm();
+        }
+    })();
+    </script>
 
-                        <!-- Detailed Status Grid -->
-                        <div style="display:grid;grid-template-columns:1fr 1fr;gap:15px">
-                            <!-- Services -->
-                            <div class="card" style="padding:15px">
-                                <h4 style="margin:0 0 15px;color:#667eea;border-bottom:2px solid #667eea;padding-bottom:8px">⚙️ سرویس‌ها</h4>
-                                <div style="display:flex;flex-direction:column;gap:10px">
-                                    <div style="display:flex;justify-content:space-between;align-items:center;padding:10px;background:<?php echo $wg_active ? '#e8f5e9' : '#ffebee'; ?>;border-radius:8px">
-                                        <span style="font-weight:600">WireGuard</span>
-                                        <span><?php echo $wg_active ? '🟢 فعال' : '🔴 غیرفعال'; ?></span>
-                                    </div>
-                                    <div style="display:flex;justify-content:space-between;align-items:center;padding:10px;background:<?php echo $nginx_active ? '#e8f5e9' : '#ffebee'; ?>;border-radius:8px">
-                                        <span style="font-weight:600">Nginx</span>
-                                        <span><?php echo $nginx_active ? '🟢 فعال' : '🔴 غیرفعال'; ?></span>
-                                    </div>
-                                    <div style="display:flex;justify-content:space-between;align-items:center;padding:10px;background:<?php echo $php_active ? '#e8f5e9' : '#ffebee'; ?>;border-radius:8px">
-                                        <span style="font-weight:600">PHP-FPM</span>
-                                        <span><?php echo $php_active ? '🟢 فعال' : '🔴 غیرفعال'; ?></span>
-                                    </div>
-                                </div>
-                            </div>
-
-                            <!-- Databases -->
-                            <div class="card" style="padding:15px">
-                                <h4 style="margin:0 0 15px;color:#667eea;border-bottom:2px solid #667eea;padding-bottom:8px">💾 دیتابیس‌ها</h4>
-                                <div style="display:flex;flex-direction:column;gap:10px">
-                                    <div style="display:flex;justify-content:space-between;align-items:center;padding:10px;background:<?php echo $etc_db_exists ? '#e8f5e9' : '#ffebee'; ?>;border-radius:8px">
-                                        <span style="font-weight:600">ETC Database</span>
-                                        <span><?php echo $etc_db_exists ? '✅ موجود' : '❌ ناموجود'; ?></span>
-                                    </div>
-                                    <div style="display:flex;justify-content:space-between;align-items:center;padding:10px;background:<?php echo $web_db_exists ? '#e8f5e9' : '#ffebee'; ?>;border-radius:8px">
-                                        <span style="font-weight:600">WEB Database</span>
-                                        <span><?php echo $web_db_exists ? '✅ موجود' : '❌ ناموجود'; ?></span>
-                                    </div>
-                                    <div style="display:flex;justify-content:space-between;align-items:center;padding:10px;background:<?php echo $scripts_ok ? '#e8f5e9' : '#ffebee'; ?>;border-radius:8px">
-                                        <span style="font-weight:600">Admin Scripts</span>
-                                        <span><?php echo $scripts_ok ? '✅ سالم' : '❌ مشکل دار'; ?></span>
-                                    </div>
-                                </div>
-                            </div>
-
-                            <!-- System Resources -->
-                            <div class="card" style="padding:15px">
-                                <h4 style="margin:0 0 15px;color:#667eea;border-bottom:2px solid #667eea;padding-bottom:8px">💻 منابع سیستم</h4>
-                                <div style="margin-bottom:15px">
-                                    <div style="display:flex;justify-content:space-between;margin-bottom:5px">
-                                        <span style="font-weight:600">💿 فضای دیسک</span>
-                                        <span style="color:<?php echo $disk_percent > 80 ? '#e74c3c' : '#2ecc71'; ?>"><?php echo $disk_percent; ?>%</span>
-                                    </div>
-                                    <div style="background:#e0e0e0;border-radius:10px;height:20px;overflow:hidden">
-                                        <div style="background:<?php echo $disk_percent > 80 ? 'linear-gradient(90deg, #e74c3c, #c0392b)' : 'linear-gradient(90deg, #2ecc71, #27ae60)'; ?>;height:100%;width:<?php echo $disk_percent; ?>%;transition:width 0.3s"></div>
-                                    </div>
-                                </div>
-                                <div style="display:flex;flex-direction:column;gap:8px">
-                                    <div style="display:flex;justify-content:space-between;padding:8px;background:#f7f9fc;border-radius:6px">
-                                        <span>⏱️ Uptime</span>
-                                        <span style="font-size:0.9em"><?php echo trim($uptime) ?: 'N/A'; ?></span>
-                                    </div>
-                                </div>
-                            </div>
-
-                            <!-- Quick Actions -->
-                            <div class="card" style="padding:15px">
-                                <h4 style="margin:0 0 15px;color:#667eea;border-bottom:2px solid #667eea;padding-bottom:8px">🔧 ابزارها</h4>
-                                <div style="display:flex;flex-direction:column;gap:10px">
-                                    <a href="/debug.php" target="_blank" style="display:block;padding:12px;background:linear-gradient(135deg, #667eea, #764ba2);color:white;text-align:center;border-radius:8px;text-decoration:none;font-weight:600">
-                                        🔍 صفحه Debug کامل
-                                    </a>
-                                    <button onclick="location.reload()" style="padding:12px;background:linear-gradient(135deg, #f093fb, #f5576c);color:white;border:none;border-radius:8px;cursor:pointer;font-weight:600">
-                                        🔄 بروزرسانی وضعیت
-                                    </button>
-                                </div>
-                            </div>
-                        </div>
-
-                        <?php if ($health_percent < 80): ?>
-                        <div style="margin-top:20px;padding:15px;background:#fff3cd;border-right:4px solid #ff9800;border-radius:8px">
-                            <strong style="color:#856404">⚠️ هشدار:</strong>
-                            <span style="color:#856404">برخی از اجزای سیستم به درستی کار نمی‌کنند. لطفاً صفحه Debug را بررسی کنید.</span>
-                        </div>
-                        <?php endif; ?>
-                    </div>
+    <script>
+    // Guard: silence noisy extension errors like "recorder is not defined" to avoid disrupting UX
+    (function(){
+        var prevHandler = window.onerror;
+        window.onerror = function(message, source, lineno, colno, error){
+            try {
+                if ((message && /recorder is not defined/i.test(String(message))) ||
+                    (error && /recorder is not defined/i.test(String(error && error.message)))) {
+                    // Swallow this specific error pattern
+                    return true; // prevent default logging
+                }
+            } catch(e){}
+            if (typeof prevHandler === 'function') {
+                return prevHandler.apply(this, arguments);
+            }
+            return false; // proceed normally
+        };
+    })();
+    </script>
 </body>
 </html>
 DEBUGPHP
@@ -2050,9 +2517,10 @@ JS
     > "$STATE.new"
     declare -A add_bytes
 
-    # Read wg dump: peer|allowed_ips|rx|tx
+    # Read wg dump: peer|allowed_ips|rx|tx (robust if wg0 down)
     # wg show wg0 dump fields for peers: $1=pubkey $2=psk $3=endpoint $4=allowed-ips $5=latest-handshake $6=rx $7=tx $8=keepalive
-    wg show wg0 dump | awk 'NR>1 {print $1"|"$4"|"$6"|"$7}' | while IFS='|' read -r peer allowed rx tx; do
+    WG_DUMP="$(wg show wg0 dump 2>/dev/null || true)"
+    printf '%s\n' "$WG_DUMP" | awk 'NR>1 {print $1"|"$4"|"$6"|"$7}' | while IFS='|' read -r peer allowed rx tx; do
         cur=$(( rx + tx ))
         ip=$(echo "$allowed" | awk -F',' '{print $1}' | sed -E 's#/.*##')
         user="${ip2user[$ip]:-}"
