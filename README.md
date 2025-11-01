@@ -7,7 +7,7 @@
 <img width="1680" height="4343" alt="image" src="https://github.com/user-attachments/assets/31c822ed-7b37-4eea-9b99-050d168bb232" />
 
                                                                   🚨debug system🚨
-<img width="1680" height="1989" alt="image" src="https://github.com/user-attachments/assets/2f5a3489-c7d8-418f-9c8b-efecac0bf1eb" />
+<img width="1680" height="1873" alt="image" src="https://github.com/user-attachments/assets/b0ecba72-491e-4f04-8e69-c1cb85e71f36" />
 
 
 ## 🚀 نصب سریع پنل اصلی
