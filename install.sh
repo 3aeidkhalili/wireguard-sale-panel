@@ -3101,6 +3101,41 @@ function get_live_server_stats()
     return $stats;
 }
 
+// Read last 7 days usage (in GB) for a specific user from /etc/wireguard/usage/YYYY-MM-DD.csv
+function get_weekly_usage($user)
+{
+    $labels = array();
+    $data = array();
+    if ($user === null) { $user = ''; }
+
+    for ($i = 6; $i >= 0; $i--) {
+        $ts = time() - ($i * 86400);
+        $date = date('Y-m-d', $ts);
+        $labels[] = $date;
+
+        $csv = '/etc/wireguard/usage/' . $date . '.csv';
+        $bytes = 0;
+        if (is_readable($csv)) {
+            $lines = @file($csv, FILE_IGNORE_NEW_LINES | FILE_SKIP_EMPTY_LINES);
+            if ($lines !== false) {
+                foreach ($lines as $line) {
+                    $parts = explode('|', trim($line), 2);
+                    if (count($parts) >= 2 && $parts[0] === $user) {
+                        // ensure numeric
+                        $val = preg_replace('/[^0-9]/', '', (string)$parts[1]);
+                        $bytes = is_numeric($val) ? intval($val) : 0;
+                        break;
+                    }
+                }
+            }
+        }
+        // Convert to GB with 2 decimals
+        $data[] = round($bytes / (1024 * 1024 * 1024), 2);
+    }
+
+    return array('labels' => $labels, 'data' => $data);
+}
+
 $server_stats = get_live_server_stats();
 ?>
 <!DOCTYPE html>
@@ -3781,22 +3816,26 @@ function changeTimeframe(days) {
     updateChart(days);
 }
 
-// تابع به روزرسانی نمودار
-function updateChart(days = 7) {
-    const ctx = document.getElementById('usageChart').getContext('2d');
-    const chartData = sampleData[days];
-    
+// تابع به روزرسانی نمودار با داده‌های هفتگی سرور
+function updateChart() {
+    const el = document.getElementById('usageChart');
+    if (!el) return;
+    const ctx = el.getContext('2d');
+    const src = (window.USER_USAGE && Array.isArray(window.USER_USAGE.labels) && Array.isArray(window.USER_USAGE.data))
+        ? window.USER_USAGE
+        : { labels: ['-','-','-','-','-','-','-'], data: [0,0,0,0,0,0,0] };
+
     if (usageChart) {
         usageChart.destroy();
     }
-    
+
     usageChart = new Chart(ctx, {
         type: 'line',
         data: {
-            labels: chartData.labels,
+            labels: src.labels,
             datasets: [{
                 label: 'مصرف داده (GB)',
-                data: chartData.data,
+                data: src.data,
                 borderColor: '#4fc3f7',
                 backgroundColor: 'rgba(79, 195, 247, 0.1)',
                 borderWidth: 2,
@@ -3876,13 +3915,13 @@ function updateChart(days = 7) {
 
 // مقداردهی اولیه نمودار هنگام لود صفحه
 document.addEventListener('DOMContentLoaded', function() {
-    updateChart(7);
+    updateChart();
 });
 
 // اگر کاربر مدیر است، تابع رفرش نمودار را نیز اضافه می‌کنیم
 function refreshChart() {
     if (usageChart) {
-        updateChart(7); // بازگشت به بازه ۷ روز و رفرش
+        updateChart(); // رفرش هفتگی بر اساس داده‌های سرور
     }
 }
     </script>
@@ -4284,7 +4323,12 @@ function refreshChart() {
                 <div class="two-column">
                     <div>
                         <div class="card">
-                                                <div class="usage-chart-container">
+                            <?php
+                            // Provide weekly usage data for the current user to the chart (window.USER_USAGE)
+                            $__tmp = get_weekly_usage($data['client_name'] ?? '');
+                            echo '<script>window.USER_USAGE=' . json_encode($__tmp, JSON_UNESCAPED_UNICODE|JSON_UNESCAPED_SLASHES) . ';</script>';
+                            ?>
+                            <div class="usage-chart-container">
                         <div class="chart-header">
                             <h3 style="margin: 0">📈 نمودار مصرف روزانه</h3>
                         </div>
@@ -4714,4 +4758,3 @@ case "${1:-}" in
         usage
         ;;
 esac
-
