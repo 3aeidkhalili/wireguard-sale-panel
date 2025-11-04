@@ -631,26 +631,6 @@ copies or substantial portions of the Software.
 
 ---
 
-## 📞 ارتباط و پشتیبانی
-
-<div align="center">
-
-### 💬 راه‌های ارتباط
-
-[![GitHub](https://img.shields.io/badge/GitHub-100000?style=for-the-badge&logo=github&logoColor=white)](https://github.com/3aeidkhalili)
-[![Telegram](https://img.shields.io/badge/Telegram-2CA5E0?style=for-the-badge&logo=telegram&logoColor=white)](https://t.me/your_username)
-[![Email](https://img.shields.io/badge/Email-D14836?style=for-the-badge&logo=gmail&logoColor=white)](mailto:support@example.com)
-
-### 🚀 پشتیبانی تجاری
-
-برای پشتیبانی حرفه‌ای، نصب اختصاصی، و توسعه سفارشی:
-
-📧 **enterprise@example.com**  
-📱 **+98 912 345 6789**  
-🌐 **[وب‌سایت رسمی](https://example.com)**
-
-</div>
-
 ---
 
 <div align="center">
