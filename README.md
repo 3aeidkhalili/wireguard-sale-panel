@@ -1,67 +1,5 @@
 # 🔐 WireGuard Sale Panel | پنل فروش وایرگارد
 
-<div align="center">
-
-![WireGuard](https://img.shields.io/badge/WireGuard-88171A?style=for-the-badge&logo=wireguard&logoColor=white)
-![Bash](https://img.shields.io/badge/Bash-4EAA25?style=for-the-badge&logo=gnu-bash&logoColor=white)
-![SQLite](https://img.shields.io/badge/SQLite-07405E?style=for-the-badge&logo=sqlite&logoColor=white)
-![PHP](https://img.shields.io/badge/PHP-777BB4?style=for-the-badge&logo=php&logoColor=white)
-![License](https://img.shields.io/badge/License-MIT-blue.svg?style=for-the-badge)
-
-**سیستم مدیریت و فروش WireGuard با واسط کاربری وب و مانیتورینگ ترافیک**
-
-[📖 مستندات](#-مستندات) • [⚡ نصب سریع](#-نصب-سریع) • [🛠️ پیکربندی](#️-پیکربندی) • [🐛 باگ‌ها](#-گزارش-باگ) • [🤝 مشارکت](#-مشارکت)
-
-</div>
-
----
-
-## 📋 فهرست مطالب
-
-- [ویژگی‌های کلیدی](#-ویژگی‌های-کلیدی)
-- [پیش‌نیازها](#-پیشنیازها)
-- [نصب سریع](#-نصب-سریع)
-- [پیکربندی پیشرفته](#️-پیکربندی-پیشرفته)
-- [مدیریت سرویس‌ها](#️-مدیریت-سرویسها)
-- [واسط کاربری وب](#-واسط-کاربری-وب)
-- [API و ادغام](#-api-و-ادغام)
-- [نظارت و لاگ‌ها](#-نظارت-و-لاگها)
-- [عیب‌یابی](#-عیبیابی)
-- [امنیت](#-امنیت)
-- [پشتیبانی](#-پشتیبانی)
-
----
-
-## 🚀 ویژگی‌های کلیدی
-
-### 📊 مدیریت کاربران
-- ✅ **ایجاد خودکار کاربران** با QR Code
-- ✅ **مدیریت کوتا ترافیک** (MB/GB/TB)
-- ✅ **تاریخ انقضا** برای هر کاربر
-- ✅ **فعال/غیرفعال کردن** کاربران
-- ✅ **گروه‌بندی کاربران** (VIP, Premium, Standard)
-
-### 📈 مانیتورینگ ترافیک
-- ✅ **نظارت لحظه‌ای** بر مصرف ترافیک
-- ✅ **قطع خودکار** هنگام تمام شدن کوتا
-- ✅ **آمار دقیق** ورودی و خروجی
-- ✅ **گزارش‌گیری روزانه/ماهانه**
-- ✅ **نمودارهای تحلیلی** مصرف
-
-### 🌐 واسط کاربری وب
-- ✅ **پنل ادمین** کامل و قدرتمند
-- ✅ **پنل کاربری** برای مشتریان
-- ✅ **رابط موبایل** واکنش‌گرا
-- ✅ **چندزبانه** (فارسی/انگلیسی)
-- ✅ **تم تاریک/روشن**
-
-### 🔧 ویژگی‌های پیشرفته
-- ✅ **پایگاه داده SQLite** سبک و سریع
-- ✅ **همگام‌سازی خودکار** با وب
-- ✅ **پشتیبان‌گیری خودکار**
-- ✅ **لاگ‌های جامع** تمام عملیات
-- ✅ **API RESTful** برای ادغام
-
 ---
 
 ## 🔧 پیش‌نیازها
@@ -98,16 +36,6 @@ wget -O install.sh https://raw.githubusercontent.com/3aeidkhalili/wireguard-sale
 
 # اجرای نصب کامل
 bash install.sh install
-```
-
-### 2️⃣ پیکربندی اولیه
-
-```bash
-# تنظیم پورت و IP سرور
-./install.sh configure
-
-# ایجاد کاربر ادمین اول
-./install.sh create-admin
 ```
 
 ### 3️⃣ راه‌اندازی سرویس مانیتورینگ
@@ -178,36 +106,8 @@ server {
 }
 ```
 
-### 🗄️ پیکربندی پایگاه داده
-
-```bash
-# بهینه‌سازی SQLite
-sqlite3 /etc/wireguard/clients.db "PRAGMA optimize;"
-sqlite3 /etc/wireguard/quota.db "PRAGMA optimize;"
-
-# بررسی یکپارچگی
-sqlite3 /etc/wireguard/clients.db "PRAGMA integrity_check;"
-```
 
 ---
-
-## 🖥️ مدیریت سرویس‌ها
-
-### 🔄 سرویس مانیتورینگ کوتا
-
-```bash
-# وضعیت سرویس
-systemctl status wg-quota-monitor.service
-
-# مشاهده لاگ‌های زنده
-journalctl -u wg-quota-monitor.service -f
-
-# راه‌اندازی مجدد
-systemctl restart wg-quota-monitor.service
-
-# توقف سرویس
-systemctl stop wg-quota-monitor.service
-```
 
 ### 🔄 سرویس همگام‌سازی وب
 
@@ -277,60 +177,6 @@ systemctl enable --now wg-web-sync.timer
 
 ---
 
-## 🔌 API و ادغام
-
-### 📡 RESTful API
-
-```bash
-# Base URL
-BASE_URL="http://your-domain.com/api"
-
-# Authentication
-curl -X POST "$BASE_URL/auth" \
-  -H "Content-Type: application/json" \
-  -d '{"username":"admin","password":"password"}'
-
-# Get clients list
-curl -X GET "$BASE_URL/clients" \
-  -H "Authorization: Bearer $TOKEN"
-
-# Create new client
-curl -X POST "$BASE_URL/clients" \
-  -H "Authorization: Bearer $TOKEN" \
-  -H "Content-Type: application/json" \
-  -d '{
-    "name": "client1",
-    "quota": "10GB",
-    "expire_date": "2024-12-31"
-  }'
-
-# Get traffic stats
-curl -X GET "$BASE_URL/stats/traffic" \
-  -H "Authorization: Bearer $TOKEN"
-```
-
-### 🔗 Webhook Integration
-
-```php
-// Example webhook for payment systems
-// File: /var/www/wireguard/webhook/payment.php
-
-<?php
-// Verify payment and create client
-$payload = json_decode(file_get_contents('php://input'), true);
-
-if (verify_payment($payload)) {
-    $client_name = generate_client_name();
-    $quota = $payload['plan']['quota'];
-    $expire_days = $payload['plan']['days'];
-    
-    exec("./wireguard-manager add-client $client_name $quota $expire_days");
-    
-    // Send config to customer
-    send_config_to_customer($payload['email'], $client_name);
-}
-?>
-```
 
 ---
 
@@ -352,48 +198,6 @@ tail -f /var/log/wg-sync.log
 journalctl -u wg-quota-monitor.service -f
 ```
 
-### 📈 آمار سیستم
-
-```bash
-# آمار کلی ترافیک
-wg show wg0
-
-# آمار کاربران فعال
-sqlite3 /etc/wireguard/clients.db "SELECT COUNT(*) FROM clients WHERE status='active';"
-
-# Top 10 کاربران پرمصرف
-sqlite3 /etc/wireguard/quota.db "
-  SELECT client_name, used_bytes/1024/1024/1024 as used_gb 
-  FROM quota 
-  ORDER BY used_bytes DESC 
-  LIMIT 10;
-"
-```
-
-### 🔔 هشدارهای خودکار
-
-```bash
-# اسکریپت هشدار کوتا
-cat > /usr/local/bin/quota-alert.sh << 'EOF'
-#!/bin/bash
-# Alert when client reaches 80% quota
-
-sqlite3 /etc/wireguard/quota.db "
-  SELECT client_name, 
-         (used_bytes * 100.0 / quota_bytes) as usage_percent
-  FROM quota 
-  WHERE usage_percent > 80;
-" | while read line; do
-    echo "Warning: $line" | mail -s "Quota Alert" admin@domain.com
-done
-EOF
-
-chmod +x /usr/local/bin/quota-alert.sh
-
-# اضافه به cron برای اجرای هر ساعت
-echo "0 * * * * /usr/local/bin/quota-alert.sh" | crontab -
-```
-
 ---
 
 ## 🔧 عیب‌یابی
@@ -409,139 +213,12 @@ wg-quick up wg0
 journalctl -u wg-quick@wg0.service
 
 # بررسی پورت‌ها
-netstat -tulpn | grep :51820
+netstat -tulpn | grep :1010
 ```
 
 #### 2️⃣ کاربران متصل نمی‌شوند
-```bash
-# بررسی Firewall
-ufw status
-iptables -L
-
-# بررسی IP forwarding
-sysctl net.ipv4.ip_forward
-
-# تست اتصال
-ping -c 3 10.66.66.1
-```
-
-#### 3️⃣ سرویس کوتا کار نمی‌کند
-```bash
-# بررسی وضعیت
-systemctl status wg-quota-monitor.service
-
-# بررسی دسترسی‌های فایل
-ls -la /etc/wireguard/*.db
-
-# تست دستی
-/usr/local/bin/wg-quota-monitor.sh check
-```
-
-### 🔍 ابزارهای تشخیص
-
-```bash
-# اسکریپت تشخیص خودکار
-cat > /usr/local/bin/wg-diagnostics.sh << 'EOF'
-#!/bin/bash
-echo "=== WireGuard Diagnostics ==="
-
-echo "1. Service Status:"
-systemctl is-active wg-quick@wg0.service
-systemctl is-active wg-quota-monitor.service
-
-echo "2. Interface Status:"
-wg show
-
-echo "3. Database Status:"
-sqlite3 /etc/wireguard/clients.db ".schema" 2>/dev/null && echo "Clients DB: OK" || echo "Clients DB: ERROR"
-
-echo "4. Network Status:"
-ping -c 1 8.8.8.8 >/dev/null && echo "Internet: OK" || echo "Internet: ERROR"
-
-echo "5. Disk Space:"
-df -h /etc/wireguard
-
-echo "6. Memory Usage:"
-free -h
-EOF
-
-chmod +x /usr/local/bin/wg-diagnostics.sh
-```
-
 ---
 
-## 🔐 امنیت
-
-### 🛡️ پیکربندی امنیتی
-
-```bash
-# 1. محدود کردن دسترسی SSH
-echo "Port 22
-PermitRootLogin no
-PasswordAuthentication no
-PubkeyAuthentication yes" >> /etc/ssh/sshd_config
-
-# 2. فعال‌سازی Firewall
-ufw enable
-ufw default deny incoming
-ufw default allow outgoing
-ufw allow 22/tcp
-ufw allow 51820/udp
-ufw allow 80/tcp
-ufw allow 443/tcp
-
-# 3. محافظت از پایگاه داده‌ها
-chmod 640 /etc/wireguard/*.db
-chown root:www-data /etc/wireguard/*.db
-
-# 4. رمزگذاری کلیدهای خصوصی
-chmod 600 /etc/wireguard/private.key
-chmod 600 /etc/wireguard/clients/*_private.key
-```
-
-### 🔑 مدیریت کلیدها
-
-```bash
-# تولید کلید جدید برای سرور
-wg genkey | tee /etc/wireguard/private.key | wg pubkey > /etc/wireguard/public.key
-
-# پشتیبان‌گیری کلیدها
-tar -czf wireguard-keys-backup-$(date +%Y%m%d).tar.gz /etc/wireguard/*.key
-
-# چرخش کلیدها (هر 6 ماه)
-/usr/local/bin/rotate-server-keys.sh
-```
-
-### 📋 Audit و Compliance
-
-```bash
-# لاگ تمام اتصالات
-echo "LogLevel INFO" >> /etc/wireguard/wg0.conf
-
-# نظارت بر تغییرات فایل‌ها
-auditctl -w /etc/wireguard/ -p wa -k wireguard-config
-
-# گزارش امنیتی ماهانه
-/usr/local/bin/security-report.sh
-```
-
----
-
-## 📚 مستندات تکمیلی
-
-### 📖 راهنماهای تخصصی
-- [نصب در محیط تولید](docs/production-setup.md)
-- [کانفیگ پیشرفته](docs/advanced-configuration.md)
-- [ادغام با سیستم‌های پرداخت](docs/payment-integration.md)
-- [مانیتورینگ با Prometheus](docs/monitoring.md)
-- [بکاپ و Disaster Recovery](docs/backup-recovery.md)
-
-### 🎥 آموزش‌های ویدئویی
-- [نصب گام به گام](https://youtube.com/watch?v=example1)
-- [مدیریت کاربران](https://youtube.com/watch?v=example2)
-- [عیب‌یابی رایج](https://youtube.com/watch?v=example3)
-
----
 
 ## 🤝 مشارکت
 
@@ -603,46 +280,3 @@ auditctl -w /etc/wireguard/ -p wa -k wireguard-config
 
 ---
 
-## 📄 مجوز
-
-این پروژه تحت مجوز [MIT License](LICENSE) منتشر شده است.
-
-```
-MIT License
-
-Copyright (c) 2024 WireGuard Sale Panel
-
-Permission is hereby granted, free of charge, to any person obtaining a copy
-of this software and associated documentation files (the "Software"), to deal
-in the Software without restriction, including without limitation the rights
-to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
-copies of the Software, and to permit persons to whom the Software is
-furnished to do so, subject to the following conditions:
-
-The above copyright notice and this permission notice shall be included in all
-copies or substantial portions of the Software.
-```
-
----
-
-## 🌟 ستاره دادن
-
-اگر این پروژه برایتان مفید بود، لطفاً ⭐ ستاره دهید!
-
----
-
----
-
-<div align="center">
-
-### ❤️ ساخته شده با عشق برای جامعه متن‌باز
-
-**"هر خط کد، یک قدم به آزادی دیجیتال"**
-
-[![Made with Love](https://img.shields.io/badge/Made%20with-❤️-red.svg)](https://github.com/3aeidkhalili/wireguard-sale-panel)
-
----
-
-⭐ اگر این پروژه مفید بود، حتماً ستاره بدهید! ⭐
-
-</div>
