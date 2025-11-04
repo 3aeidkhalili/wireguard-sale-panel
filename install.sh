@@ -2557,8 +2557,9 @@ CRON
     # Create PHP file (Persian interface)
     # [PHP content remains the same as original]
     cat > "$WEB_DIR/index.php" <<'PHP'
-<?php
-header('Content-Type: text/html; charset=utf-8');
+ <?php
+ob_start(); // شروع output buffering
+
 function h($s)
 {
     return htmlspecialchars($s, ENT_QUOTES, 'UTF-8');
@@ -2572,6 +2573,23 @@ $is_admin = false;
 $admin_message = "";
 $clients_list = array();
 $server_info = array();
+
+// تابع پاکسازی peer های خالی از کانفیگ
+function clean_empty_peers()
+{
+    $config_file = '/etc/wireguard/wg0.conf';
+    $temp_file = '/tmp/wg0_cleaned_' . time() . '.conf';
+    
+    $cmd = "sudo awk 'BEGIN{in_peer=0;peer_content=\"\"}";
+    $cmd .= "/^\\[Interface\\]/{print;in_peer=0;next}";
+    $cmd .= "/^\\[Peer\\]/{if(in_peer&&peer_content!=\"\"){print \"[Peer]\";print peer_content}in_peer=1;peer_content=\"\";next}";
+    $cmd .= "{if(in_peer){if(\$0!~/^[[:space:]]*\$/){if(peer_content!=\"\"){peer_content=peer_content\"\\n\"\$0}else{peer_content=\$0}}}else{print}}";
+    $cmd .= "END{if(in_peer&&peer_content!=\"\"){print \"[Peer]\";print peer_content}}'";
+    $cmd .= " $config_file > $temp_file && sudo mv $temp_file $config_file && sudo chmod 600 $config_file";
+    
+    error_log("Cleaning empty peers from config");
+    shell_exec($cmd . " 2>&1");
+}
 
 // دریافت اطلاعات سرور
 function get_server_info()
@@ -2587,12 +2605,40 @@ function get_server_info()
         $dns = @file_get_contents('/var/www/wireguard/db/dns.db');
     }
 
-    $status_output = @shell_exec('systemctl is-active wg-quick@wg0 2>/dev/null');
+    // دریافت کلید عمومی سرور
+    $public_key = @file_get_contents('/etc/wireguard/server_public.key');
+    if ($public_key === false || trim($public_key) === '') {
+        $public_key = @file_get_contents('/var/www/wireguard/server_public.key');
+    }
+
+    // Force fresh status check every time - no caching
+    // Use custom script to avoid sudo password issues
+    $status_output = @shell_exec('sudo /usr/local/bin/wg-service-control is-active 2>&1');
     $status = trim($status_output ?: 'unknown');
+    
+    // Log for debugging if needed
+    error_log("WireGuard status check: raw='" . $status_output . "' trimmed='" . $status . "'");
+    
+    // تبدیل خروجی های مختلف به active یا inactive
+    if (in_array($status, ['active', 'activating'])) {
+        $status = 'active';
+    } elseif (in_array($status, ['inactive', 'failed', 'deactivating', 'unknown'])) {
+        $status = 'inactive';
+    }
+    
+    // Additional verification - check if WG interface exists
+    if ($status === 'active') {
+        $wg_check = @shell_exec('wg show wg0 2>/dev/null');
+        if (empty($wg_check)) {
+            error_log("WireGuard service active but no interface found");
+            // Keep status as active since systemctl reports it as such
+        }
+    }
 
     return array(
         'endpoint' => trim($endpoint) ?: 'SERVER_IP:1010',
         'dns' => trim($dns) ?: '1.1.1.1,8.8.8.8',
+        'public_key' => trim($public_key) ?: '',
         'status' => $status
     );
 }
@@ -2699,20 +2745,30 @@ function get_clients_list()
 // تابع پشتیبان‌گیری
 function create_backup()
 {
+    error_log("=== شروع پشتیبان‌گیری WireGuard ===");
+    
     // Store backups under web directory so panel and web user can access them
     $web_backup_root = '/var/www/wireguard/backups';
+    error_log("مسیر ریشه بک‌اپ: " . $web_backup_root);
+    
     if (!is_dir($web_backup_root)) {
+        error_log("ایجاد پوشه backups...");
         @mkdir($web_backup_root, 0755, true);
         @chown($web_backup_root, 'www-data');
         @chgrp($web_backup_root, 'www-data');
+        error_log("پوشه backups ایجاد شد: " . (is_dir($web_backup_root) ? 'موفق' : 'ناموفق'));
     }
 
     $backup_dir = $web_backup_root . '/wireguard-backup-' . date('Y-m-d-H-i-s');
     $backup_file = $backup_dir . '.tar.gz';
+    error_log("نام پوشه بک‌اپ: " . $backup_dir);
+    error_log("نام فایل آرشیو: " . $backup_file);
 
     if (!mkdir($backup_dir, 0755, true)) {
+        error_log("خطا: نتوانست پوشه بک‌اپ را ایجاد کند");
         return false;
     }
+    error_log("پوشه بک‌اپ موقت ایجاد شد");
 
     // Prefer web copies of DBs
     $web_db_dir = '/var/www/wireguard/db';
@@ -2727,68 +2783,159 @@ function create_backup()
         '/etc/wireguard/server_private.key'
     ];
 
+    $backup_count = 0;
+    $failed_files = [];
+    
+    error_log("شروع کپی فایل‌ها...");
     foreach ($files_to_backup as $file) {
+        $dest = $backup_dir . '/' . basename($file);
         if (file_exists($file)) {
-            copy($file, $backup_dir . '/' . basename($file));
+            if (copy($file, $dest)) {
+                $backup_count++;
+                $size = filesize($file);
+                error_log("کپی شد: " . $file . " (" . $size . " بایت)");
+            } else {
+                $failed_files[] = $file . " (اصلی)";
+                error_log("خطا در کپی: " . $file);
+            }
         } else {
             // Try fallback to /etc for DBs
             $etc_path = '/etc/wireguard/' . basename($file);
             if (file_exists($etc_path)) {
-                copy($etc_path, $backup_dir . '/' . basename($etc_path));
+                if (copy($etc_path, $dest)) {
+                    $backup_count++;
+                    $size = filesize($etc_path);
+                    error_log("کپی شد (fallback): " . $etc_path . " (" . $size . " بایت)");
+                } else {
+                    $failed_files[] = $etc_path . " (fallback)";
+                    error_log("خطا در کپی fallback: " . $etc_path);
+                }
+            } else {
+                $failed_files[] = $file . " (فایل وجود ندارد)";
+                error_log("فایل یافت نشد: " . $file . " یا " . $etc_path);
             }
         }
     }
 
     // copy clients directory from /etc or web copy
+    $clients_copied = false;
     if (is_dir($web_db_dir . '/../clients')) {
-        shell_exec("cp -r " . escapeshellarg($web_db_dir . '/../clients') . " " . escapeshellarg($backup_dir) . " 2>&1");
-    } elseif (is_dir('/etc/wireguard/clients')) {
-        shell_exec("cp -r /etc/wireguard/clients " . escapeshellarg($backup_dir) . " 2>&1");
+        $web_clients = $web_db_dir . '/../clients';
+        $cmd = "cp -r " . escapeshellarg($web_clients) . " " . escapeshellarg($backup_dir) . " 2>&1";
+        error_log("کپی کردن پوشه clients از web: " . $web_clients);
+        $result = shell_exec($cmd);
+        if (is_dir($backup_dir . '/clients')) {
+            $clients_copied = true;
+            $client_count = count(glob($backup_dir . '/clients/*'));
+            error_log("پوشه clients کپی شد - تعداد فایل‌ها: " . $client_count);
+        } else {
+            error_log("خطا در کپی پوشه clients از web: " . $result);
+        }
+    } 
+    
+    if (!$clients_copied && is_dir('/etc/wireguard/clients')) {
+        $cmd = "cp -r /etc/wireguard/clients " . escapeshellarg($backup_dir) . " 2>&1";
+        error_log("کپی کردن پوشه clients از /etc/wireguard/clients");
+        $result = shell_exec($cmd);
+        if (is_dir($backup_dir . '/clients')) {
+            $clients_copied = true;
+            $client_count = count(glob($backup_dir . '/clients/*'));
+            error_log("پوشه clients کپی شد از /etc - تعداد فایل‌ها: " . $client_count);
+        } else {
+            error_log("خطا در کپی پوشه clients از /etc: " . $result);
+        }
+    }
+
+    error_log("تعداد فایل‌های کپی شده: " . $backup_count);
+    error_log("پوشه clients کپی شد: " . ($clients_copied ? 'بله' : 'خیر'));
+    if (!empty($failed_files)) {
+        error_log("فایل‌های ناموفق: " . implode(', ', $failed_files));
     }
 
     // create archive
+    error_log("شروع ایجاد آرشیو...");
     $cmd = "tar -czf " . escapeshellarg($backup_file) . " -C " . escapeshellarg(dirname($backup_dir)) . " " . escapeshellarg(basename($backup_dir)) . " 2>&1";
+    error_log("دستور tar: " . $cmd);
     $result = shell_exec($cmd);
+    
+    if ($result) {
+        error_log("خروجی tar: " . trim($result));
+    }
 
     // cleanup
+    error_log("پاکسازی پوشه موقت...");
     shell_exec("rm -rf " . escapeshellarg($backup_dir));
 
     if (file_exists($backup_file)) {
+        $archive_size = filesize($backup_file);
+        error_log("آرشیو ایجاد شد: " . $backup_file . " (" . $archive_size . " بایت)");
         @chown($backup_file, 'www-data');
         @chgrp($backup_file, 'www-data');
+        error_log("=== پشتیبان‌گیری با موفقیت تکمیل شد ===");
         return $backup_file;
+    } else {
+        error_log("خطا: فایل آرشیو ایجاد نشد");
+        error_log("=== پشتیبان‌گیری ناموفق ===");
+        return false;
     }
-    return false;
 }
 
 // تابع بازنشانی پشتیبان
 function restore_backup($backup_file)
 {
+    error_log("=== شروع بازیابی پشتیبان WireGuard ===");
+    error_log("فایل بازیابی: " . $backup_file);
+    
     if (!file_exists($backup_file)) {
+        error_log("خطا: فایل پشتیبان یافت نشد: " . $backup_file);
         return "فایل پشتیبان یافت نشد";
     }
 
+    $backup_size = filesize($backup_file);
+    error_log("حجم فایل بازیابی: " . $backup_size . " بایت");
+
     $extract_dir = '/tmp/wireguard-restore-' . date('Y-m-d-H-i-s');
+    error_log("پوشه استخراج: " . $extract_dir);
 
     // استخراج فایل آرشیو
     // ensure extraction directory exists
     if (!is_dir($extract_dir)) {
-        mkdir($extract_dir, 0755, true);
+        if (!mkdir($extract_dir, 0755, true)) {
+            error_log("خطا: نتوانست پوشه استخراج را ایجاد کند");
+            return "خطا در ایجاد پوشه استخراج";
+        }
+        error_log("پوشه استخراج ایجاد شد");
     }
-    $result = shell_exec("tar -xzf " . escapeshellarg($backup_file) . " -C " . escapeshellarg($extract_dir) . " 2>&1");
+    
+    $tar_cmd = "tar -xzf " . escapeshellarg($backup_file) . " -C " . escapeshellarg($extract_dir) . " 2>&1";
+    error_log("دستور استخراج: " . $tar_cmd);
+    $result = shell_exec($tar_cmd);
+    
+    if ($result) {
+        error_log("خروجی tar extract: " . trim($result));
+    }
 
     if (!is_dir($extract_dir)) {
+        error_log("خطا: پوشه استخراج ایجاد نشد");
         return "خطا در استخراج فایل پشتیبان";
     }
 
     // پیدا کردن دایرکتوری بکاپ
     $backup_dirs = glob($extract_dir . '/wireguard-backup-*');
+    error_log("پوشه‌های backup یافت شده: " . implode(', ', $backup_dirs));
+    
     if (empty($backup_dirs)) {
+        error_log("خطا: ساختار پشتیبان نامعتبر است");
         shell_exec("rm -rf " . escapeshellarg($extract_dir));
         return "ساختار پشتیبان نامعتبر است";
     }
 
     $backup_dir = $backup_dirs[0];
+    error_log("پوشه backup انتخابی: " . $backup_dir);
+    
+    // بررسی محتویات پوشه backup
+    $backup_contents = glob($backup_dir . '/*');
+    error_log("محتویات backup: " . implode(', ', array_map('basename', $backup_contents)));
 
     // بازنشانی فایل‌ها
     $files_to_restore = [
@@ -2802,60 +2949,212 @@ function restore_backup($backup_file)
         'server_private.key'
     ];
 
+    $restored_count = 0;
+    $failed_files = [];
+    
+    error_log("شروع بازیابی فایل‌ها...");
     foreach ($files_to_restore as $file) {
         $source = $backup_dir . '/' . $file;
         $destination = '/etc/wireguard/' . $file;
 
         if (file_exists($source)) {
-            copy($source, $destination);
-            chmod($destination, 600);
+            if (copy($source, $destination)) {
+                chmod($destination, 600);
+                $size = filesize($destination);
+                error_log("بازیابی شد: " . $file . " (" . $size . " بایت)");
+                $restored_count++;
+            } else {
+                $failed_files[] = $file;
+                error_log("خطا در بازیابی: " . $file);
+            }
+        } else {
+            error_log("فایل در backup یافت نشد: " . $file);
         }
     }
 
+    error_log("تعداد فایل‌های بازیابی شده: " . $restored_count);
+    if (!empty($failed_files)) {
+        error_log("فایل‌های ناموفق در بازیابی: " . implode(', ', $failed_files));
+    }
+
     // بازنشانی دایرکتوری کلاینت‌ها
+    $clients_restored = false;
     if (is_dir($backup_dir . '/clients')) {
+        error_log("شروع بازیابی پوشه clients...");
+        $client_files_before = is_dir('/etc/wireguard/clients') ? count(glob('/etc/wireguard/clients/*')) : 0;
+        error_log("تعداد فایل‌های client قبل از بازیابی: " . $client_files_before);
+        
         shell_exec("rm -rf /etc/wireguard/clients");
-        shell_exec("cp -r " . escapeshellarg($backup_dir . '/clients') . " /etc/wireguard/ 2>&1");
+        error_log("پوشه clients قدیمی حذف شد");
+        
+        $cp_result = shell_exec("cp -r " . escapeshellarg($backup_dir . '/clients') . " /etc/wireguard/ 2>&1");
+        if ($cp_result) {
+            error_log("خروجی کپی clients: " . trim($cp_result));
+        }
+        
         shell_exec("chmod -R 600 /etc/wireguard/clients");
+        
+        if (is_dir('/etc/wireguard/clients')) {
+            $client_files_after = count(glob('/etc/wireguard/clients/*'));
+            error_log("تعداد فایل‌های client بعد از بازیابی: " . $client_files_after);
+            $clients_restored = true;
+        } else {
+            error_log("خطا: پوشه clients بازیابی نشد");
+        }
+    } else {
+        error_log("پوشه clients در backup یافت نشد");
     }
 
     // راه‌اندازی مجدد سرویس
-    shell_exec("systemctl restart wg-quick@wg0 2>&1");
+    error_log("راه‌اندازی مجدد سرویس WireGuard...");
+    $restart_result = shell_exec("systemctl restart wg-quick@wg0 2>&1");
+    if ($restart_result) {
+        error_log("خروجی restart service: " . trim($restart_result));
+    }
+    
+    // بررسی وضعیت سرویس پس از restart
+    sleep(2); // انتظار کوتاه برای اطمینان از start شدن سرویس
+    $status_check = shell_exec("systemctl is-active wg-quick@wg0 2>&1");
+    error_log("وضعیت سرویس پس از restart: " . trim($status_check));
 
     // همگام‌سازی با دیتابیس وب: copy each file and set ownership
+    error_log("شروع همگام‌سازی با دیتابیس وب...");
     $web_db_dir = '/var/www/wireguard/db';
     if (!is_dir($web_db_dir)) {
         @mkdir($web_db_dir, 0755, true);
+        error_log("پوشه web db ایجاد شد");
     }
 
+    $sync_count = 0;
     foreach (['clients.db', 'quota.db', 'admin.db', 'endpoint.db', 'dns.db'] as $f) {
         $etc_path = '/etc/wireguard/' . $f;
         $web_path = $web_db_dir . '/' . $f;
         if (file_exists($etc_path)) {
-            copy($etc_path, $web_path);
-            @chmod($web_path, 0640);
-            @chown($web_path, 'www-data');
-            @chgrp($web_path, 'www-data');
+            if (copy($etc_path, $web_path)) {
+                @chmod($web_path, 0640);
+                @chown($web_path, 'www-data');
+                @chgrp($web_path, 'www-data');
+                $size = filesize($web_path);
+                error_log("همگام‌سازی شد: " . $f . " (" . $size . " بایت)");
+                $sync_count++;
+            } else {
+                error_log("خطا در همگام‌سازی: " . $f);
+            }
+        } else {
+            error_log("فایل برای همگام‌سازی یافت نشد: " . $etc_path);
         }
     }
+    error_log("تعداد فایل‌های همگام‌سازی شده: " . $sync_count);
 
     // copy clients directory into web area for panel usage
     if (is_dir('/etc/wireguard/clients')) {
+        error_log("کپی کردن پوشه clients به محیط web...");
         $web_clients_dir = '/var/www/wireguard/clients';
-        shell_exec("rm -rf " . escapeshellarg($web_clients_dir) . " 2>&1");
-        shell_exec("cp -r /etc/wireguard/clients " . escapeshellarg('/var/www/wireguard/') . " 2>&1");
+        $rm_result = shell_exec("rm -rf " . escapeshellarg($web_clients_dir) . " 2>&1");
+        if ($rm_result) {
+            error_log("خروجی حذف web clients: " . trim($rm_result));
+        }
+        
+        $cp_web_result = shell_exec("cp -r /etc/wireguard/clients " . escapeshellarg('/var/www/wireguard/') . " 2>&1");
+        if ($cp_web_result) {
+            error_log("خروجی کپی web clients: " . trim($cp_web_result));
+        }
+        
         shell_exec("chmod -R 640 " . escapeshellarg($web_clients_dir) . " 2>&1");
         shell_exec("chown -R www-data:www-data " . escapeshellarg($web_clients_dir) . " 2>&1");
+        
+        if (is_dir($web_clients_dir)) {
+            $web_client_count = count(glob($web_clients_dir . '/*'));
+            error_log("پوشه web clients کپی شد - تعداد فایل‌ها: " . $web_client_count);
+        }
+    } else {
+        error_log("پوشه /etc/wireguard/clients برای کپی به web یافت نشد");
     }
 
     // حذف فایل‌های موقت
-    shell_exec("rm -rf " . escapeshellarg($extract_dir));
+    error_log("پاکسازی فایل‌های موقت...");
+    $cleanup_result = shell_exec("rm -rf " . escapeshellarg($extract_dir));
+    error_log("فایل‌های موقت پاک شد");
+
+    error_log("=== بازیابی پشتیبان با موفقیت تکمیل شد ===");
+    error_log("آمار نهایی - فایل‌ها: " . $restored_count . ", Clients: " . ($clients_restored ? 'بله' : 'خیر') . ", همگام‌سازی: " . $sync_count);
 
     return "پشتیبان با موفقیت بازنشانی شد و سرویس راه‌اندازی مجدد شد";
 }
 
+// تابع دریافت لیست بک‌اپ‌های موجود
+function get_backup_list()
+{
+    $backup_dir = '/var/www/wireguard/backups';
+    $backups = [];
+    
+    error_log("دریافت لیست backup ها از: " . $backup_dir);
+    
+    if (!is_dir($backup_dir)) {
+        error_log("پوشه backups وجود ندارد");
+        return $backups;
+    }
+    
+    // جستجوی فایل‌های tar.gz
+    $backup_files = glob($backup_dir . '/wireguard-backup-*.tar.gz');
+    error_log("تعداد backup های یافت شده: " . count($backup_files));
+    
+    foreach ($backup_files as $file) {
+        if (is_file($file)) {
+            $basename = basename($file);
+            $size = filesize($file);
+            $created = filemtime($file);
+            
+            // استخراج تاریخ از نام فایل
+            if (preg_match('/wireguard-backup-(\d{4}-\d{2}-\d{2}-\d{2}-\d{2}-\d{2})\.tar\.gz/', $basename, $matches)) {
+                $date_string = $matches[1];
+                $formatted_date = DateTime::createFromFormat('Y-m-d-H-i-s', $date_string);
+                $display_date = $formatted_date ? $formatted_date->format('Y/m/d H:i:s') : $date_string;
+            } else {
+                $display_date = date('Y/m/d H:i:s', $created);
+            }
+            
+            $backups[] = [
+                'filename' => $basename,
+                'filepath' => $file,
+                'size' => $size,
+                'size_formatted' => formatBytes($size),
+                'created' => $created,
+                'date' => $display_date
+            ];
+            
+            error_log("Backup: " . $basename . " (" . formatBytes($size) . ")");
+        }
+    }
+    
+    // مرتب‌سازی بر اساس تاریخ ایجاد (جدیدترین اول)
+    usort($backups, function($a, $b) {
+        return $b['created'] - $a['created'];
+    });
+    
+    return $backups;
+}
+
+// تابع فرمت کردن حجم فایل
+function formatBytes($bytes, $precision = 2) {
+    $units = array('B', 'KB', 'MB', 'GB', 'TB');
+    
+    for ($i = 0; $bytes > 1024 && $i < count($units) - 1; $i++) {
+        $bytes /= 1024;
+    }
+    
+    return round($bytes, $precision) . ' ' . $units[$i];
+}
+
 // پردازش درخواست‌های مدیریتی
 if ($_SERVER['REQUEST_METHOD'] === 'POST') {
+    // Ensure per-request initialization so previous requests don't leak state
+    $ok = false;
+    $data = null;
+    $qr_code = "";
+    $clients_list = array();
+    $server_info = array();
+
     $pk = trim($_POST['pk'] ?? '');
     
     // Debug logging
@@ -2878,7 +3177,7 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
         
         error_log("Admin check result (parsed): " . ($is_admin ? "true" : "false"));
 
-        if ($is_admin) {
+    if ($is_admin) {
             $ok = true;
             $data = array('client_name' => 'مدیر سیستم', 'ip_address' => 'N/A', 'is_admin' => true);
             // Expose admin PK to JS for subsequent AJAX calls
@@ -2887,6 +3186,7 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
             // دریافت لیست کاربران
             $clients_list = get_clients_list();
             $server_info = get_server_info();
+            $backup_list = get_backup_list();
             // پشتیبانی از رفرش AJAX (فقط tbody جدول کاربران)
             if (isset($_POST['action']) && $_POST['action'] === 'refresh') {
                 // بازسازی tbody و بازگشت سریع
@@ -2902,18 +3202,21 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
                         $days_remaining = $client['days_remaining'] === '∞' ? '∞' : h($client['days_remaining']);
                         $active = $client['active'] ? 'فعال' : 'غیرفعال';
                         $name_escaped = str_replace("'", "\\'", $name);
+                        // Safely escape private_key for inline JavaScript
+                        $private_key_js_escaped = str_replace(["\\", "'", "\n", "\r"], ["\\\\", "\\'", "\\n", "\\r"], $private_key);
+                        
                         $row = "<tr>\n" .
                             "<td><strong>{$name}</strong></td>\n" .
                             "<td>{$ip}</td>\n" .
-                            "<td>\n<div class=\"key-container\">\n<input type=\"text\" class=\"private-key\" value=\"{$private_key}\" readonly>\n<button class=\"copy-btn\" onclick=\"copyToClipboard(this)\">📋</button>\n<button class=\"btn\" onclick=\"showKeyModal(this.parentElement.querySelector(\\\'.private-key\\\').value)\">🔍</button>\n</div>\n</td>\n" .
+                            "<td>\n<div class=\"key-container\">\n<input type=\"text\" class=\"private-key\" value=\"{$private_key}\" readonly>\n<button class=\"copy-btn\" onclick=\"copyToClipboard(this)\"><i class=\"fas fa-copy\"></i></button>\n<button class=\"btn btn-primary\" onclick=\"showKeyModal('{$private_key_js_escaped}')\" style=\"padding: 6px 10px;\"><i class=\"fas fa-eye\"></i></button>\n</div>\n</td>\n" .
                             "<td>{$used_gb}</td>\n" .
                             "<td>{$limit_gb}</td>\n" .
                             "<td class=\"" . (($client['remaining_gb'] === '∞' || $client['remaining_gb'] > 0) ? 'success' : 'error') . "\"> <strong>{$remaining_gb}</strong></td>\n" .
                             "<td>{$expiry}</td>\n" .
                             "<td class=\"" . (($client['days_remaining'] === '∞' || $client['days_remaining'] > 7) ? 'success' : (($client['days_remaining'] > 0) ? 'warning' : 'error')) . "\"><strong>{$days_remaining}</strong></td>\n" .
                             "<td class=\"" . ($client['active'] ? 'success' : 'error') . "\">{$active}</td>\n" .
-                            "<td>\n<div class=\"controls\">\n<button type=\"button\" onclick=\"showEditForm('{$name_escaped}', {$limit_gb}, " . ($days_remaining === '∞' ? 0 : $days_remaining) . ")\" class=\"btn-warning\" style=\"width:auto;padding:8px 15px;margin:2px;\">✏️ ویرایش</button>\n" .
-                            "<button type=\"button\" onclick=\"if(confirm('آیا از حذف کاربر {$name_escaped} مطمئن هستید؟')) sendAdminAction('remove-client', '{$name_escaped}')\" class=\"btn-danger\" style=\"width:auto;padding:8px 15px;margin:2px;\">🗑️ حذف</button>\n</div>\n</td>\n" .
+                            "<td>\n<div class=\"controls\">\n<button type=\"button\" onclick=\"showEditForm('{$name_escaped}', {$limit_gb}, " . ($days_remaining === '∞' ? 0 : $days_remaining) . ")\" class=\"btn btn-warning\" style=\"padding: 8px 12px;\"><i class=\"fas fa-edit\"></i></button>\n" .
+                            "<button type=\"button\" onclick=\"if(confirm('آیا از حذف کاربر {$name_escaped} مطمئن هستید؟')) sendAdminAction('remove-client', '{$name_escaped}')\" class=\"btn btn-danger\" style=\"padding: 8px 12px;\"><i class=\"fas fa-trash\"></i></button>\n</div>\n</td>\n" .
                             "</tr>\n";
                         echo $row;
                     }
@@ -2939,15 +3242,89 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
                     $dns = $param3 ?? '1.1.1.1,8.8.8.8';
 
                     if (!empty($domain) && !empty($port) && !empty($dns)) {
+                        $endpoint_value = $domain . ':' . $port;
+                        
+                        error_log("set-endpoint: domain=$domain, port=$port, dns=$dns");
+                        
+                        // استفاده از اسکریپت جدید برای به‌روزرسانی settings
+                        $update_cmd = "sudo /usr/local/bin/wg-update-settings " .
+                            escapeshellarg($endpoint_value) . " " .
+                            escapeshellarg($dns);
+                        
+                        $update_result = shell_exec($update_cmd . " 2>&1");
+                        
+                        // بررسی خطا در به‌روزرسانی settings
+                        $settings_error = false;
+                        if ($update_result !== null && trim($update_result) !== '') {
+                            $out = strtolower($update_result);
+                            $settings_error = (strpos($out, 'error') !== false) || 
+                                            (strpos($out, 'خطا') !== false) || 
+                                            (strpos($out, 'failed') !== false);
+                        }
+                        
+                        if ($settings_error) {
+                            $admin_message = "خطا در به‌روزرسانی تنظیمات: " . trim($update_result);
+                            error_log("Settings update error: " . trim($update_result));
+                            
+                            $is_ajax = isset($_SERVER['HTTP_X_REQUESTED_WITH']) && 
+                                       strtolower($_SERVER['HTTP_X_REQUESTED_WITH']) === 'xmlhttprequest';
+                            
+                            if ($is_ajax) {
+                                if (ob_get_level()) {
+                                    ob_end_clean();
+                                }
+                                header('Content-Type: application/json; charset=utf-8');
+                                echo json_encode([
+                                    'status' => 'error',
+                                    'message' => $admin_message
+                                ], JSON_UNESCAPED_UNICODE);
+                                exit;
+                            }
+                            
+                            $server_info = get_server_info();
+                            return;
+                        }
+                        
+                        // فراخوانی اسکریپت برای به‌روزرسانی کانفیگ‌های کاربران
                         $endpoint_cmd = "sudo /usr/local/bin/wg-update-endpoint " .
                             escapeshellarg($domain) . " " .
                             escapeshellarg($port) . " " .
                             escapeshellarg($dns);
                         $admin_result = shell_exec($endpoint_cmd . " 2>&1");
-                        $admin_message = $admin_result ?: "تنظیمات endpoint و DNS با موفقیت به‌روزرسانی شد";
+                        
+                        // بررسی خطا در به‌روزرسانی کانفیگ‌های کاربران
+                        $config_error = false;
+                        if ($admin_result !== null && trim($admin_result) !== '') {
+                            $out = strtolower($admin_result);
+                            $config_error = (strpos($out, 'error') !== false) || 
+                                          (strpos($out, 'خطا') !== false) || 
+                                          (strpos($out, 'failed') !== false);
+                        }
+                        
+                        if ($config_error) {
+                            $admin_message = "تنظیمات ذخیره شد اما خطا در به‌روزرسانی کانفیگ‌های کاربران: " . trim($admin_result);
+                        } else {
+                            $admin_message = "تنظیمات endpoint و DNS با موفقیت به‌روزرسانی شد. Endpoint: {$endpoint_value}, DNS: {$dns}";
+                        }
 
                         // بروزرسانی اطلاعات سرور
                         $server_info = get_server_info();
+                        
+                        // ارسال پاسخ JSON برای AJAX
+                        $is_ajax = isset($_SERVER['HTTP_X_REQUESTED_WITH']) && 
+                                   strtolower($_SERVER['HTTP_X_REQUESTED_WITH']) === 'xmlhttprequest';
+                        
+                        if ($is_ajax) {
+                            if (ob_get_level()) {
+                                ob_end_clean();
+                            }
+                            header('Content-Type: application/json; charset=utf-8');
+                            echo json_encode([
+                                'status' => $config_error ? 'error' : 'success',
+                                'message' => $admin_message
+                            ], JSON_UNESCAPED_UNICODE);
+                            exit;
+                        }
                     } else {
                         $admin_message = "خطا: تمام فیلدهای endpoint و DNS باید پر شوند";
                     }
@@ -2956,12 +3333,27 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
                 elseif ($action === 'backup') {
                     $backup_file = create_backup();
                     if ($backup_file) {
+                        // ایجاد یک کپی برای دانلود و نگه داشتن اصلی
+                        $download_file = '/tmp/download-' . basename($backup_file);
+                        copy($backup_file, $download_file);
+                        
                         header('Content-Type: application/octet-stream');
                         header('Content-Disposition: attachment; filename="' . basename($backup_file) . '"');
-                        header('Content-Length: ' . filesize($backup_file));
-                        readfile($backup_file);
-                        unlink($backup_file);
+                        header('Content-Length: ' . filesize($download_file));
+                        readfile($download_file);
+                        unlink($download_file); // فقط فایل موقت حذف می‌شود
                         exit;
+                    } else {
+                        $admin_message = "خطا در ایجاد پشتیبان";
+                    }
+                }
+                // ایجاد پشتیبان بدون دانلود فوری
+                elseif ($action === 'create-backup-only') {
+                    $backup_file = create_backup();
+                    if ($backup_file) {
+                        $admin_message = "پشتیبان با موفقیت ایجاد شد: " . basename($backup_file);
+                        // بروزرسانی لیست backup ها
+                        $backup_list = get_backup_list();
                     } else {
                         $admin_message = "خطا در ایجاد پشتیبان";
                     }
@@ -2980,12 +3372,415 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
                             // بروزرسانی اطلاعات پس از بازنشانی
                             $clients_list = get_clients_list();
                             $server_info = get_server_info();
+                            $backup_list = get_backup_list();
                         } else {
                             $admin_message = "خطا در آپلود فایل پشتیبان";
                         }
                     } else {
                         $admin_message = "لطفا یک فایل پشتیبان انتخاب کنید";
                     }
+                }
+                // دانلود بک‌اپ ذخیره شده
+                elseif ($action === 'download-backup') {
+                    $filename = $_POST['filename'] ?? '';
+                    error_log("درخواست دانلود backup: " . $filename);
+                    
+                    if (empty($filename)) {
+                        $admin_message = "نام فایل مشخص نشده است";
+                    } else {
+                        // بررسی امنیتی نام فایل
+                        $filename = basename($filename); // حذف مسیرهای نامناسب
+                        $backup_file = '/var/www/wireguard/backups/' . $filename;
+                        
+                        error_log("مسیر فایل backup: " . $backup_file);
+                        
+                        if (file_exists($backup_file) && strpos($filename, 'wireguard-backup-') === 0 && substr($filename, -7) === '.tar.gz') {
+                            error_log("شروع دانلود backup: " . $filename . " (" . filesize($backup_file) . " بایت)");
+                            
+                            header('Content-Type: application/octet-stream');
+                            header('Content-Disposition: attachment; filename="' . $filename . '"');
+                            header('Content-Length: ' . filesize($backup_file));
+                            readfile($backup_file);
+                            exit;
+                        } else {
+                            error_log("فایل backup یافت نشد یا نامعتبر است: " . $backup_file);
+                            $admin_message = "فایل پشتیبان یافت نشد یا نامعتبر است";
+                        }
+                    }
+                }
+                // افزودن کاربر (پاسخ JSON برای استفاده در AJAX)
+                elseif ($action === 'add-client') {
+                    // پاک کردن هر خروجی قبلی و بستن output buffer
+                    if (ob_get_level()) {
+                        ob_end_clean();
+                    }
+                    
+                    $admin_cmd = "sudo /usr/local/bin/wg-admin " .
+                        escapeshellarg('add-client') . " " .
+                        escapeshellarg($param1) . " " .
+                        escapeshellarg($param2) . " " .
+                        escapeshellarg($param3);
+
+                    error_log("Executing add-client: $admin_cmd");
+                    $admin_result = shell_exec($admin_cmd . " 2>&1");
+                    error_log("add-client result: " . ($admin_result ?: "empty"));
+
+                    // پاکسازی peer های خالی
+                    clean_empty_peers();
+
+                    // تشخیص خطا از خروجی
+                    $has_error = false;
+                    if ($admin_result !== null && trim($admin_result) !== '') {
+                        $out = strtolower($admin_result);
+                        $has_error = (strpos($out, 'error') !== false) || 
+                                    (strpos($out, 'خطا') !== false) || 
+                                    (strpos($out, 'failed') !== false) ||
+                                    (strpos($out, 'already exists') !== false);
+                    }
+
+                    if ($has_error) {
+                        header('Content-Type: application/json; charset=utf-8');
+                        echo json_encode([
+                            'status' => 'error',
+                            'message' => trim((string)$admin_result)
+                        ], JSON_UNESCAPED_UNICODE);
+                        exit;
+                    }
+
+                    // بازیابی اطلاعات کاربر جدید با روش مطمئن‌تر
+                    $newClient = null;
+                    
+                    // روش اول: خواندن مستقیم از فایل کلید خصوصی
+                    $private_key_file = "/var/www/wireguard/clients/{$param1}_private.key";
+                    $private_key = '';
+                    if (file_exists($private_key_file)) {
+                        $private_key = trim(file_get_contents($private_key_file));
+                    }
+                    
+                    // اگر در مسیر web نبود، از مسیر /etc بخوانیم
+                    if (empty($private_key)) {
+                        $etc_key_file = "/etc/wireguard/clients/{$param1}_private.key";
+                        if (file_exists($etc_key_file)) {
+                            $private_key = trim(file_get_contents($etc_key_file));
+                        }
+                    }
+                    
+                    // روش دوم: پیدا کردن IP کاربر از خروجی دستور
+                    $ip_address = '';
+                    if (preg_match('/IP:\s*([0-9]+\.[0-9]+\.[0-9]+\.[0-9]+)/', $admin_result, $matches)) {
+                        $ip_address = $matches[1];
+                    }
+                    
+                    // اگر IP از خروجی پیدا نشد، از دیتابیس بگیریم
+                    if (empty($ip_address)) {
+                        $clients_list = get_clients_list();
+                        foreach ($clients_list as $c) {
+                            if (isset($c['name']) && $c['name'] === $param1) {
+                                $ip_address = $c['ip'] ?? '';
+                                if (empty($private_key)) {
+                                    $private_key = $c['private_key'] ?? '';
+                                }
+                                break;
+                            }
+                        }
+                    }
+                    
+                    // تولید QR Code
+                    $qr_code = '';
+                    if (!empty($private_key) && !empty($ip_address)) {
+                        // تولید محتوای کانفیگ کامل برای QR
+                        $server_public_key = '';
+                        $server_public_key_file = '/etc/wireguard/server_public.key';
+                        if (file_exists($server_public_key_file)) {
+                            $server_public_key = trim(file_get_contents($server_public_key_file));
+                        }
+                        
+                        if (empty($server_public_key)) {
+                            $server_public_key_file = '/var/www/wireguard/server_public.key';
+                            if (file_exists($server_public_key_file)) {
+                                $server_public_key = trim(file_get_contents($server_public_key_file));
+                            }
+                        }
+                        
+                        // دریافت اطلاعات سرور
+                        $temp_server_info = get_server_info();
+                        $endpoint = $temp_server_info['endpoint'] ?? 'SERVER_IP:1010';
+                        $dns = $temp_server_info['dns'] ?? '1.1.1.1,8.8.8.8';
+                        
+                        // ساخت کانفیگ کامل
+                        $config_content = "[Interface]\n";
+                        $config_content .= "PrivateKey = {$private_key}\n";
+                        $config_content .= "Address = {$ip_address}/24\n";
+                        $config_content .= "DNS = {$dns}\n";
+                        $config_content .= "MTU = 1420\n\n";
+                        $config_content .= "[Peer]\n";
+                        $config_content .= "PublicKey = {$server_public_key}\n";
+                        $config_content .= "Endpoint = {$endpoint}\n";
+                        $config_content .= "AllowedIPs = 0.0.0.0/0, ::/0\n";
+                        $config_content .= "PersistentKeepalive = 25\n";
+                        
+                        // ذخیره موقت کانفیگ
+                        $temp_config = "/tmp/wg_temp_config_{$param1}_" . time() . ".conf";
+                        file_put_contents($temp_config, $config_content);
+                        
+                        // تولید QR با qrencode - روش اول: مستقیم از فایل
+                        $qr_cmd = "cat " . escapeshellarg($temp_config) . " | qrencode -t PNG -o - 2>&1";
+                        $qr_output = shell_exec($qr_cmd);
+                        
+                        // بررسی اینکه خروجی واقعاً PNG است
+                        $is_png = (!empty($qr_output) && substr($qr_output, 0, 4) === "\x89PNG");
+                        
+                        if ($is_png) {
+                            $qr_code = base64_encode($qr_output);
+                            error_log("QR Code generated successfully with qrencode");
+                        } else {
+                            error_log("QR Code generation with qrencode failed: " . substr($qr_output, 0, 100));
+                            
+                            // روش دوم: با اسکریپت سفارشی
+                            $qr_cmd2 = "sudo /usr/local/bin/wg-generate-qr " . escapeshellarg($temp_config) . " 2>&1";
+                            $qr_output2 = shell_exec($qr_cmd2);
+                            
+                            if (!empty($qr_output2) && substr($qr_output2, 0, 4) === "\x89PNG") {
+                                $qr_code = base64_encode($qr_output2);
+                                error_log("QR Code generated successfully with custom script");
+                            } else {
+                                error_log("QR Code generation with custom script also failed");
+                            }
+                        }
+                        
+                        // پاک کردن فایل موقت
+                        @unlink($temp_config);
+                        
+                        // لاگ برای دیباگ
+                        error_log("QR Code generation result: " . (!empty($qr_code) ? "success (length: " . strlen($qr_code) . ")" : "failed"));
+                    } else {
+                        error_log("QR Code generation skipped: private_key=" . (!empty($private_key) ? "present" : "missing") . ", ip=" . (!empty($ip_address) ? "present" : "missing"));
+                    }
+
+                    header('Content-Type: application/json; charset=utf-8');
+                    $resp = [
+                        'status' => 'success',
+                        'name' => $param1,
+                        'ip' => $ip_address,
+                        'private_key' => $private_key,
+                        'qr' => $qr_code,
+                        'param2' => $param2,
+                        'param3' => $param3
+                    ];
+
+                    echo json_encode($resp, JSON_UNESCAPED_UNICODE);
+                    exit;
+                }
+                // ویرایش کاربر
+                elseif ($action === 'edit-client') {
+                    // پاک کردن هر خروجی قبلی
+                    if (ob_get_level()) {
+                        ob_end_clean();
+                    }
+                    
+                    $admin_cmd = "sudo /usr/local/bin/wg-admin " .
+                        escapeshellarg('edit-client') . " " .
+                        escapeshellarg($param1) . " " .
+                        escapeshellarg($param2) . " " .
+                        escapeshellarg($param3);
+
+                    error_log("Executing edit-client: $admin_cmd");
+                    $admin_result = shell_exec($admin_cmd . " 2>&1");
+                    error_log("edit-client result: " . ($admin_result ?: "empty"));
+
+                    // پاکسازی peer های خالی
+                    clean_empty_peers();
+
+                    // تشخیص خطا از خروجی
+                    $has_error = false;
+                    $error_detail = '';
+                    if ($admin_result !== null && trim($admin_result) !== '') {
+                        $out = strtolower($admin_result);
+                        $has_error = (strpos($out, 'error') !== false) || 
+                                    (strpos($out, 'خطا') !== false) || 
+                                    (strpos($out, 'failed') !== false) ||
+                                    (strpos($out, 'not found') !== false) ||
+                                    (strpos($out, 'invalid') !== false);
+                        
+                        if ($has_error) {
+                            $error_detail = trim($admin_result);
+                        }
+                    }
+
+                    // ارسال پاسخ (بدون تنظیم header اگر فرم معمولی است)
+                    // بررسی اینکه آیا درخواست AJAX است یا نه
+                    $is_ajax = isset($_SERVER['HTTP_X_REQUESTED_WITH']) && 
+                               strtolower($_SERVER['HTTP_X_REQUESTED_WITH']) === 'xmlhttprequest';
+
+                    if ($has_error) {
+                        $admin_message = "خطا در ویرایش کاربر: " . $error_detail;
+                        error_log("Error in edit-client: $admin_message");
+                        
+                        if ($is_ajax) {
+                            header('Content-Type: application/json; charset=utf-8');
+                            echo json_encode([
+                                'status' => 'error',
+                                'message' => $error_detail,
+                                'debug' => [
+                                    'command' => $admin_cmd,
+                                    'output' => $admin_result
+                                ]
+                            ], JSON_UNESCAPED_UNICODE);
+                            exit;
+                        }
+                    } else {
+                        $success_msg = "کاربر {$param1} با موفقیت ویرایش شد (سهمیه: {$param2}GB، مدت: {$param3} روز)";
+                        $admin_message = $success_msg;
+                        error_log("Success: $success_msg");
+                        
+                        if ($is_ajax) {
+                            header('Content-Type: application/json; charset=utf-8');
+                            echo json_encode([
+                                'status' => 'success',
+                                'message' => $success_msg,
+                                'client_name' => $param1,
+                                'new_quota' => $param2,
+                                'new_days' => $param3
+                            ], JSON_UNESCAPED_UNICODE);
+                            exit;
+                        }
+                    }
+
+                    // رفرش اطلاعات برای نمایش معمولی
+                    $clients_list = get_clients_list();
+                    $server_info = get_server_info();
+                }
+                // حذف کاربر
+                elseif ($action === 'remove-client') {
+                    // پاک کردن هر خروجی قبلی
+                    if (ob_get_level()) {
+                        ob_end_clean();
+                    }
+                    
+                    $admin_cmd = "sudo /usr/local/bin/wg-admin " .
+                        escapeshellarg('remove-client') . " " .
+                        escapeshellarg($param1);
+
+                    error_log("Executing remove-client: $admin_cmd");
+                    $admin_result = shell_exec($admin_cmd . " 2>&1");
+                    error_log("remove-client result: " . ($admin_result ?: "empty"));
+
+                    // پاکسازی peer های خالی
+                    clean_empty_peers();
+
+                    // تشخیص خطا
+                    $has_error = false;
+                    if ($admin_result !== null && trim($admin_result) !== '') {
+                        $out = strtolower($admin_result);
+                        $has_error = (strpos($out, 'error') !== false) || 
+                                    (strpos($out, 'خطا') !== false) || 
+                                    (strpos($out, 'failed') !== false) ||
+                                    (strpos($out, 'not found') !== false);
+                    }
+
+                    // بررسی AJAX
+                    $is_ajax = isset($_SERVER['HTTP_X_REQUESTED_WITH']) && 
+                               strtolower($_SERVER['HTTP_X_REQUESTED_WITH']) === 'xmlhttprequest';
+
+                    if ($has_error) {
+                        $admin_message = "خطا: " . trim((string)$admin_result);
+                        error_log("Error in remove-client: $admin_message");
+                        
+                        if ($is_ajax) {
+                            header('Content-Type: application/json; charset=utf-8');
+                            echo json_encode([
+                                'status' => 'error',
+                                'message' => $admin_message
+                            ], JSON_UNESCAPED_UNICODE);
+                            exit;
+                        }
+                    } else {
+                        $success_msg = "کاربر {$param1} با موفقیت حذف شد";
+                        $admin_message = $success_msg;
+                        error_log("Success: $success_msg");
+                        
+                        if ($is_ajax) {
+                            header('Content-Type: application/json; charset=utf-8');
+                            echo json_encode([
+                                'status' => 'success',
+                                'message' => $success_msg,
+                                'client_name' => $param1
+                            ], JSON_UNESCAPED_UNICODE);
+                            exit;
+                        }
+                    }
+
+                    // رفرش اطلاعات برای نمایش معمولی
+                    $clients_list = get_clients_list();
+                    $server_info = get_server_info();
+                }
+                // پردازش عملیات مدیریت سرویس
+                elseif ($action === 'start-service' || $action === 'stop-service' || $action === 'restart-service' || $action === 'update-status') {
+                    $service_commands = [
+                        'start-service' => '/usr/local/bin/wg-service-control start',
+                        'stop-service' => '/usr/local/bin/wg-service-control stop',
+                        'restart-service' => '/usr/local/bin/wg-service-control restart',
+                        'update-status' => '/usr/local/bin/wg-service-control is-active'
+                    ];
+                    
+                    $service_messages = [
+                        'start-service' => 'سرویس WireGuard با موفقیت راه‌اندازی شد',
+                        'stop-service' => 'سرویس WireGuard با موفقیت متوقف شد',
+                        'restart-service' => 'سرویس WireGuard با موفقیت راه‌اندازی مجدد شد',
+                        'update-status' => 'وضعیت سرویس به‌روز شد'
+                    ];
+                    
+                    if (isset($service_commands[$action])) {
+                        $cmd = "sudo " . $service_commands[$action] . " 2>&1";
+                        error_log("Executing service command: $cmd");
+                        $result = shell_exec($cmd);
+                        error_log("Service command result: " . ($result ?: "empty"));
+                        
+                        // صبر کنید تا سرویس به طور کامل شروع/متوقف شود
+                        if ($action !== 'update-status') {
+                            usleep(500000); // 0.5 ثانیه تاخیر
+                        }
+                        
+                        // بروزرسانی وضعیت سرویس
+                        $server_info = get_server_info();
+                        
+                        // بررسی خطا
+                        $has_error = false;
+                        if ($result !== null && trim($result) !== '') {
+                            $out = strtolower($result);
+                            $has_error = (strpos($out, 'failed') !== false) || 
+                                        (strpos($out, 'error') !== false) ||
+                                        (strpos($out, 'inactive') !== false && $action === 'start-service');
+                        }
+                        
+                        if ($has_error) {
+                            $admin_message = "خطا در اجرای دستور: " . trim($result);
+                        } else {
+                            $admin_message = $service_messages[$action];
+                        }
+                        
+                        // بررسی AJAX
+                        $is_ajax = isset($_SERVER['HTTP_X_REQUESTED_WITH']) && 
+                                   strtolower($_SERVER['HTTP_X_REQUESTED_WITH']) === 'xmlhttprequest';
+                        
+                        if ($is_ajax) {
+                            if (ob_get_level()) {
+                                ob_end_clean();
+                            }
+                            header('Content-Type: application/json; charset=utf-8');
+                            echo json_encode([
+                                'status' => $has_error ? 'error' : 'success',
+                                'message' => $admin_message,
+                                'service_status' => $server_info['status']
+                            ], JSON_UNESCAPED_UNICODE);
+                            exit;
+                        }
+                    } else {
+                        $admin_message = "دستور سرویس نامعتبر است";
+                    }
+                    
+                    // رفرش اطلاعات
+                    $clients_list = get_clients_list();
                 }
                 // سایر عملیات
                 else {
@@ -3026,13 +3821,66 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
             $cmd = "sudo /usr/local/bin/wg-client-info " . escapeshellarg($pk);
             $output = shell_exec($cmd . " 2>&1");
             if ($output !== null) {
+                // Try to decode JSON. If decoding fails, log and provide a minimal fallback so UI can render
                 $data = json_decode($output, true);
-                if (is_array($data) && isset($data['status']) && $data['status'] === 'success') {
+                if (json_last_error() !== JSON_ERROR_NONE || !is_array($data)) {
+                    error_log("wg-client-info: failed to decode JSON: " . json_last_error_msg() . " -- raw output: " . substr($output, 0, 2000));
+                    // Provide safe fallback data so the user panel can still render and show an informative message
+                    $data = array(
+                        'client_name' => 'کاربر',
+                        'ip_address' => '',
+                        'data_used' => 0,
+                        'remaining_data' => 0,
+                        'days_remaining' => 0,
+                        'usage_percent' => 0,
+                        'data_limit' => 0,
+                        'is_active' => false,
+                        'server_dns' => '1.1.1.1,8.8.8.8',
+                        'server_public_key' => '',
+                        'server_endpoint' => ''
+                    );
+                    $msg = "خطا در پردازش اطلاعات کاربر (خروجی نامعتبر). لطفاً دوباره تلاش کنید.";
+                    // Still allow page to render for the user with fallback info
                     $ok = true;
+                } elseif (isset($data['status']) && $data['status'] === 'success') {
+                    $ok = true;
+                    
+                    // Store private key in data array for later use
+                    $data['private_key'] = $pk;
+                    
                     $qr_cmd = "sudo /usr/local/bin/wg-generate-qr " . escapeshellarg($pk);
                     $qr_output = shell_exec($qr_cmd . " 2>&1");
                     if (!empty($qr_output)) {
                         $qr_code = trim($qr_output);
+                    }
+                    // اگر درخواست دانلود فایل کانفیگ باشد، همین‌جا پاسخ فایل را ارسال می‌کنیم
+                    if (isset($_POST['user_action']) && $_POST['user_action'] === 'download-config') {
+                        $clientName = preg_replace('/[^A-Za-z0-9_\-\.]/', '_', $data['client_name'] ?? 'client');
+                        $filename = $clientName . '.conf';
+                        $config = "[Interface]\n" .
+                                  "PrivateKey = " . ($pk) . "\n" .
+                                  "Address = " . ($data['ip_address'] ?? '') . "/24\n" .
+                                  "DNS = " . ($data['server_dns'] ?? '1.1.1.1,8.8.8.8') . "\n" .
+                                  "MTU = 1420\n\n" .
+                                  "[Peer]\n" .
+                                  "PublicKey = " . ($data['server_public_key'] ?? '') . "\n" .
+                                  "Endpoint = " . ($data['server_endpoint'] ?? '') . "\n" .
+                                  "AllowedIPs = 0.0.0.0/0, ::/0\n" .
+                                  "PersistentKeepalive = 25\n";
+
+                        // Clear any previous output buffers
+                        while (ob_get_level()) {
+                            ob_end_clean();
+                        }
+                        
+                        // ارسال فایل برای دانلود
+                        header('Content-Type: application/octet-stream');
+                        header('Content-Disposition: attachment; filename="' . $filename . '"');
+                        header('Content-Length: ' . strlen($config));
+                        header('Cache-Control: no-cache, must-revalidate');
+                        header('Expires: 0');
+                        echo $config;
+                        exit;
                     }
                 } else {
                     $msg = $data['message'] ?? "کلید نامعتبر یا کاربر یافت نشد";
@@ -3137,435 +3985,717 @@ function get_weekly_usage($user)
 }
 
 $server_stats = get_live_server_stats();
+
+// Debug log: help identify why private key div/modal may not show after login
+// This logs key state after request processing so you can check PHP error logs.
+// Look for lines starting with "wireguard-panel: debug" in your webserver/PHP error log.
+if (php_sapi_name() !== 'cli') {
+    $dbg_ok = isset($ok) ? ($ok ? '1' : '0') : 'undef';
+    $dbg_admin = isset($is_admin) ? ($is_admin ? '1' : '0') : 'undef';
+    $dbg_msg = isset($msg) ? $msg : '';
+    $dbg_data_keys = '';
+    if (isset($data) && is_array($data)) {
+        $dbg_data_keys = implode(',', array_keys($data));
+    }
+    $dbg_private_present = (isset($data['private_key']) && $data['private_key']) ? '1' : '0';
+    $dbg_qr = (!empty($qr_code)) ? '1' : '0';
+    error_log("wireguard-panel: debug: ok={$dbg_ok}, is_admin={$dbg_admin}, private_key_present={$dbg_private_present}, qr={$dbg_qr}, data_keys={$dbg_data_keys}, msg=" . substr($dbg_msg,0,1000));
+}
+
+// برای نمایش HTML، header را تنظیم کنیم
+header('Content-Type: text/html; charset=utf-8');
 ?>
 <!DOCTYPE html>
 <html lang="fa" dir="rtl">
-
 <head>
     <meta charset="utf-8">
     <meta name="viewport" content="width=device-width, initial-scale=1">
     <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
-
-    <title>پنل مدیریت WireGuard</title>
+    <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.4.0/css/all.min.css">
+    <title>پنل حرفه‌ای مدیریت WireGuard</title>
     <style>
+        :root {
+            --primary: #6366f1;
+            --primary-dark: #4f46e5;
+            --secondary: #10b981;
+            --danger: #ef4444;
+            --warning: #f59e0b;
+            --dark: #1e293b;
+            --darker: #0f172a;
+            --light: #f8fafc;
+            --gray: #64748b;
+            --card-bg: rgba(30, 41, 59, 0.7);
+            --card-border: rgba(255, 255, 255, 0.1);
+        }
+
         * {
             box-sizing: border-box;
             margin: 0;
             padding: 0;
-            font-family: vazir, Arial, sans-serif;
+            font-family: 'Vazir', 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif;
         }
 
         body {
-            font-family: vazir, Arial, sans-serif;
-            background: linear-gradient(135deg, #1a1a2e 0%, #16213e 100%);
-            color: #ffffff;
+            background: linear-gradient(135deg, var(--darker) 0%, var(--dark) 100%);
+            color: var(--light);
             line-height: 1.6;
             min-height: 100vh;
-            padding: 20px;
+            padding: 0;
+            overflow-x: hidden;
         }
 
         .container {
             max-width: 1400px;
             margin: 0 auto;
-        }
-
-        .header {
-            text-align: center;
-            margin-bottom: 30px;
             padding: 20px;
-            background: rgba(255, 255, 255, 0.1);
-            border-radius: 15px;
+        }
+
+        /* Header Styles */
+        .header {
+            background: var(--card-bg);
             backdrop-filter: blur(10px);
+            border-radius: 20px;
+            padding: 25px 30px;
+            margin-bottom: 30px;
+            border: 1px solid var(--card-border);
+            box-shadow: 0 10px 25px rgba(0, 0, 0, 0.2);
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
         }
 
-        .header h1 {
-            color: #4fc3f7;
-            margin-bottom: 10px;
-            font-size: 2.2em;
+        .logo {
+            display: flex;
+            align-items: center;
+            gap: 15px;
         }
 
-        .header p {
-            color: #ccc;
-            font-size: 1.1em;
+        .logo-icon {
+            width: 50px;
+            height: 50px;
+            background: linear-gradient(135deg, var(--primary), var(--primary-dark));
+            border-radius: 12px;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            font-size: 24px;
         }
 
+        .logo-text h1 {
+            font-size: 1.8em;
+            margin-bottom: 5px;
+            background: linear-gradient(135deg, var(--primary), #8b5cf6);
+            background-clip: text;
+            -webkit-background-clip: text;
+            -webkit-text-fill-color: transparent;
+        }
+
+        .logo-text p {
+            color: var(--gray);
+            font-size: 0.9em;
+        }
+
+        .user-badge {
+            background: rgba(16, 185, 129, 0.1);
+            border: 1px solid rgba(16, 185, 129, 0.3);
+            border-radius: 50px;
+            padding: 8px 20px;
+            display: flex;
+            align-items: center;
+            gap: 8px;
+            font-size: 0.9em;
+        }
+
+        .admin-badge {
+            background: rgba(99, 102, 241, 0.1);
+            border: 1px solid rgba(99, 102, 241, 0.3);
+            border-radius: 50px;
+            padding: 8px 20px;
+            display: flex;
+            align-items: center;
+            gap: 8px;
+            font-size: 0.9em;
+        }
+
+        /* Card Styles */
         .card {
-            background: rgba(255, 255, 255, 0.1);
-            border-radius: 15px;
-            padding: 25px;
-            margin: 20px 0;
+            background: var(--card-bg);
             backdrop-filter: blur(10px);
-            border: 1px solid rgba(255, 255, 255, 0.2);
+            border-radius: 20px;
+            padding: 25px;
+            margin-bottom: 25px;
+            border: 1px solid var(--card-border);
+            box-shadow: 0 8px 20px rgba(0, 0, 0, 0.15);
+            transition: transform 0.3s ease, box-shadow 0.3s ease;
         }
 
-        input,
-        button,
-        select,
-        textarea {
-            padding: 12px 15px;
-            border-radius: 10px;
-            border: 1px solid #444;
-            background: rgba(0, 0, 0, 0.4);
-            color: #fff;
+        .card:hover {
+            transform: translateY(-5px);
+            box-shadow: 0 12px 25px rgba(0, 0, 0, 0.25);
+        }
+
+        .card-header {
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            margin-bottom: 20px;
+        }
+
+        .card-title {
+            font-size: 1.4em;
+            display: flex;
+            align-items: center;
+            gap: 10px;
+        }
+
+        .card-title i {
+            color: var(--primary);
+        }
+
+        /* Form Styles */
+        .form-group {
+            margin-bottom: 20px;
+        }
+
+        .form-label {
+            display: block;
+            margin-bottom: 8px;
+            font-weight: 500;
+            color: var(--gray);
+        }
+
+        .form-input {
             width: 100%;
+            padding: 15px 20px;
+            border-radius: 12px;
+            border: 1px solid rgba(255, 255, 255, 0.1);
+            background: rgba(15, 23, 42, 0.7);
+            color: var(--light);
             font-size: 16px;
-            margin: 5px 0;
-        }
-
-        input:focus,
-        select:focus,
-        textarea:focus {
-            outline: none;
-            border-color: #4fc3f7;
-            box-shadow: 0 0 10px rgba(79, 195, 247, 0.3);
-        }
-
- .chart-container {
-    background: rgba(255, 255, 255, 0.05);
-    border-radius: 12px;
-    padding: 20px;
-    margin: 20px 0;
-}
-
-.chart-controls {
-    display: flex;
-    gap: 10px;
-    margin-bottom: 15px;
-    justify-content: center;
-}
-
-.chart-timeframe {
-    background: rgba(79, 195, 247, 0.2);
-    border: 1px solid #4fc3f7;
-    border-radius: 20px;
-    padding: 8px 16px;
-    color: #4fc3f7;
-    cursor: pointer;
-    transition: all 0.3s ease;
-}
-
-.chart-timeframe:hover,
-.chart-timeframe.active {
-    background: #4fc3f7;
-    color: white;
-}
-
-#usageChart {
-    width: 100% !important;
-    height: 300px !important;
-}
-
-        button {
-            background: linear-gradient(135deg, #4fc3f7 0%, #2196f3 100%);
-            border: none;
-            color: white;
-            cursor: pointer;
-            font-weight: bold;
             transition: all 0.3s ease;
         }
 
-        button:hover {
+        .form-input:focus {
+            outline: none;
+            border-color: var(--primary);
+            box-shadow: 0 0 0 3px rgba(99, 102, 241, 0.2);
+        }
+
+        .btn {
+            display: inline-flex;
+            align-items: center;
+            justify-content: center;
+            gap: 8px;
+            padding: 15px 25px;
+            border-radius: 12px;
+            border: none;
+            font-size: 16px;
+            font-weight: 600;
+            cursor: pointer;
+            transition: all 0.3s ease;
+            text-decoration: none;
+        }
+
+        .btn-primary {
+            background: linear-gradient(135deg, var(--primary), var(--primary-dark));
+            color: white;
+        }
+
+        .btn-primary:hover {
             transform: translateY(-2px);
-            box-shadow: 0 5px 15px rgba(33, 150, 243, 0.4);
+            box-shadow: 0 7px 15px rgba(99, 102, 241, 0.4);
         }
 
-        .grid {
+        .btn-success {
+            background: linear-gradient(135deg, var(--secondary), #059669);
+            color: white;
+        }
+
+        .btn-success:hover {
+            transform: translateY(-2px);
+            box-shadow: 0 7px 15px rgba(16, 185, 129, 0.4);
+        }
+
+        .btn-warning {
+            background: linear-gradient(135deg, var(--warning), #d97706);
+            color: white;
+        }
+
+        .btn-warning:hover {
+            transform: translateY(-2px);
+            box-shadow: 0 7px 15px rgba(245, 158, 11, 0.4);
+        }
+
+        .btn-danger {
+            background: linear-gradient(135deg, var(--danger), #dc2626);
+            color: white;
+        }
+
+        .btn-danger:hover {
+            transform: translateY(-2px);
+            box-shadow: 0 7px 15px rgba(239, 68, 68, 0.4);
+        }
+
+        .btn-block {
+            width: 100%;
+        }
+
+        /* Stats Grid */
+        .stats-grid {
             display: grid;
-            grid-template-columns: repeat(auto-fit, minmax(200px, 1fr));
+            grid-template-columns: repeat(auto-fit, minmax(250px, 1fr));
+            gap: 20px;
+            margin-bottom: 25px;
+        }
+
+        .stat-card {
+            background: var(--card-bg);
+            border-radius: 16px;
+            padding: 20px;
+            border: 1px solid var(--card-border);
+            display: flex;
+            align-items: center;
             gap: 15px;
-            margin-top: 20px;
+            transition: transform 0.3s ease;
         }
 
-        .stat {
+        .stat-card:hover {
+            transform: translateY(-5px);
+        }
+
+        .stat-icon {
+            width: 60px;
+            height: 60px;
+            border-radius: 12px;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            font-size: 24px;
+        }
+
+        .stat-icon.primary {
+            background: rgba(99, 102, 241, 0.2);
+            color: var(--primary);
+        }
+
+        .stat-icon.success {
+            background: rgba(16, 185, 129, 0.2);
+            color: var(--secondary);
+        }
+
+        .stat-icon.warning {
+            background: rgba(245, 158, 11, 0.2);
+            color: var(--warning);
+        }
+
+        .stat-icon.danger {
+            background: rgba(239, 68, 68, 0.2);
+            color: var(--danger);
+        }
+
+        .stat-info {
+            flex: 1;
+        }
+
+        .stat-value {
+            font-size: 1.8em;
+            font-weight: 700;
+            margin-bottom: 5px;
+        }
+
+        .stat-label {
+            color: var(--gray);
+            font-size: 0.9em;
+        }
+
+        /* Usage Progress */
+        .usage-card {
+            position: relative;
+            overflow: hidden;
+        }
+
+        .usage-header {
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            margin-bottom: 15px;
+        }
+
+        .usage-percent {
+            font-size: 2.5em;
+            font-weight: 700;
+            background: linear-gradient(135deg, var(--primary), #8b5cf6);
+            background-clip: text;
+            -webkit-background-clip: text;
+            -webkit-text-fill-color: transparent;
+        }
+
+        .progress-container {
+            height: 12px;
             background: rgba(255, 255, 255, 0.1);
-            padding: 20px;
             border-radius: 10px;
-            text-align: center;
-            border: 1px solid rgba(255, 255, 255, 0.1);
-        }
-
-        .stat .value {
-            font-size: 1.3em;
-            font-weight: bold;
-            margin: 10px 0;
-        }
-
-        .stat .label {
-            font-size: 0.9em;
-            opacity: 0.8;
-            color: #ccc;
-        }
-
-        .success {
-            color: #66bb6a;
-        }
-
-        .warning {
-            color: #ffb74d;
-        }
-
-        .error {
-            color: #f44336;
-        }
-
-        .message {
-            padding: 15px;
-            border-radius: 10px;
-            margin: 15px 0;
-            text-align: center;
-        }
-
-        .message.error {
-            background: rgba(244, 67, 54, 0.2);
-            border: 1px solid #f44336;
-        }
-
-        .message.success {
-            background: rgba(76, 175, 80, 0.2);
-            border: 1px solid #4caf50;
-        }
-
-        .help {
-            font-size: 0.9em;
-            opacity: 0.8;
-            margin-top: 10px;
-            color: #ccc;
-        }
-
-        .config-section {
-            background: #1e1e1e;
-            padding: 20px;
-            border-radius: 10px;
+            overflow: hidden;
             margin: 20px 0;
+        }
+
+        .progress-bar {
+            height: 100%;
+            border-radius: 10px;
+            background: linear-gradient(90deg, var(--primary), var(--primary-dark));
+            position: relative;
+            transition: width 1s ease-in-out;
+        }
+
+        .progress-bar::after {
+            content: '';
+            position: absolute;
+            top: 0;
+            left: 0;
+            bottom: 0;
+            right: 0;
+            background-image: linear-gradient(
+                -45deg,
+                rgba(255, 255, 255, 0.2) 25%,
+                transparent 25%,
+                transparent 50%,
+                rgba(255, 255, 255, 0.2) 50%,
+                rgba(255, 255, 255, 0.2) 75%,
+                transparent 75%,
+                transparent
+            );
+            background-size: 20px 20px;
+            animation: move 1s linear infinite;
+        }
+
+        @keyframes move {
+            0% {
+                background-position: 0 0;
+            }
+            100% {
+                background-position: 20px 0;
+            }
+        }
+
+        .usage-details {
+            display: flex;
+            justify-content: space-between;
+            margin-top: 10px;
+            color: var(--gray);
+            font-size: 0.9em;
+        }
+
+        /* Config Section */
+        .config-container {
+            position: relative;
+        }
+
+        .config-content {
+            background: rgba(15, 23, 42, 0.8);
+            border-radius: 12px;
+            padding: 20px;
+            font-family: 'Courier New', monospace;
+            font-size: 14px;
+            line-height: 1.5;
+            max-height: 200px;
+            overflow-y: auto;
             direction: ltr;
             text-align: left;
+            border: 1px solid rgba(255, 255, 255, 0.05);
         }
 
-        .config-code {
-            color: #ccc;
-            font-family: 'Courier New', monospace;
-            font-size: 12px;
-            white-space: pre-wrap;
-            word-break: break-all;
+        .config-actions {
+            display: flex;
+            gap: 10px;
+            margin-top: 15px;
+        }
+
+        /* QR Section */
+        .qr-section {
+            text-align: center;
         }
 
         .qr-container {
-            text-align: center;
-            margin: 20px 0;
+            display: inline-block;
+            padding: 20px;
+            background: white;
+            border-radius: 16px;
+            box-shadow: 0 10px 25px rgba(0, 0, 0, 0.2);
+            margin: 15px 0;
         }
 
         .qr-image {
-            max-width: 300px;
-            border: 2px solid #4fc3f7;
-            border-radius: 10px;
-            padding: 10px;
-            background: white;
-        }
-
-        .two-column {
-            grid-template-columns: 1fr 1fr;
-            gap: 20px;
-        }
-
-        .admin-panel {
-            border-left: 4px solid #4fc3f7;
-        }
-
-        .notice {
-            padding: 10px;
+            max-width: 220px;
             border-radius: 8px;
-            margin-bottom: 12px;
         }
 
-        .notice.ok {
-            background: rgba(16, 185, 129, 0.08);
-            border: 1px solid rgba(16, 185, 129, 0.12);
-            color: #10b981;
-        }
-
-        .notice.err {
-            background: rgba(239, 68, 68, 0.06);
-            border: 1px solid rgba(239, 68, 68, 0.12);
-            color: #ef4444;
-        }
-
-        .controls {
+        /* Tabs */
+        .tabs {
             display: flex;
-            gap: 8px;
-            flex-wrap: wrap;
+            background: rgba(15, 23, 42, 0.7);
+            border-radius: 12px;
+            padding: 5px;
+            margin-bottom: 20px;
         }
 
-        .small {
-            font-size: 13px;
-            color: #94a3b8;
+        .tab {
+            flex: 1;
+            text-align: center;
+            padding: 12px;
+            border-radius: 10px;
+            cursor: pointer;
+            transition: all 0.3s ease;
         }
 
+        .tab.active {
+            background: var(--primary);
+        }
+
+        .tab-content {
+            display: none;
+        }
+
+        .tab-content.active {
+            display: block;
+        }
+
+        /* Status Indicators */
+        .status-badge {
+            display: inline-flex;
+            align-items: center;
+            gap: 6px;
+            padding: 6px 12px;
+            border-radius: 50px;
+            font-size: 0.85em;
+            font-weight: 500;
+        }
+
+        .status-active {
+            background: rgba(16, 185, 129, 0.15);
+            color: var(--secondary);
+        }
+
+        .status-inactive {
+            background: rgba(239, 68, 68, 0.15);
+            color: var(--danger);
+        }
+
+        /* Table Styles */
         .table-container {
             overflow-x: auto;
             margin: 15px 0;
+            border-radius: 12px;
+            border: 1px solid var(--card-border);
         }
 
         table {
             width: 100%;
-            border-collapse: separate;
-            border-spacing: 0;
-            background: rgba(255, 255, 255, 0.05);
-            border-radius: 14px;
-            overflow: hidden;
-            box-shadow: 0 2px 16px 0 rgba(0, 0, 0, 0.07);
+            border-collapse: collapse;
+            background: var(--card-bg);
         }
 
-        th,
-        td {
-            padding: 12px 8px;
+        th, td {
+            padding: 12px 15px;
             text-align: center;
-            border-bottom: 1.5px solid rgba(79, 195, 247, 0.08);
-            font-size: 15px;
+            border-bottom: 1px solid rgba(255, 255, 255, 0.1);
         }
 
         th {
-            background: rgba(79, 195, 247, 0.13);
-            font-weight: bold;
-            color: #4fc3f7;
-            border-bottom: 2px solid #4fc3f7;
-        }
-
-        tr {
-            transition: background 0.2s;
+            background: rgba(99, 102, 241, 0.1);
+            color: var(--primary);
+            font-weight: 600;
         }
 
         tr:hover {
-            background: rgba(33, 150, 243, 0.08);
+            background: rgba(255, 255, 255, 0.05);
         }
 
         .key-container {
             display: flex;
             align-items: center;
-            gap: 6px;
+            gap: 8px;
             justify-content: center;
         }
 
         .private-key {
             font-family: 'Courier New', monospace;
-            font-size: 13px;
-            background: #23272e;
-            color: #4fc3f7;
-            border: 1px solid #4fc3f7;
-            border-radius: 7px;
-            padding: 4px 8px;
-            width: 170px;
+            font-size: 12px;
+            background: rgba(15, 23, 42, 0.8);
+            color: var(--primary);
+            border: 1px solid rgba(99, 102, 241, 0.3);
+            border-radius: 6px;
+            padding: 6px 10px;
+            width: 150px;
             direction: ltr;
             text-align: left;
-            transition: box-shadow 0.2s;
-        }
-
-        .private-key:focus {
-            box-shadow: 0 0 0 2px #4fc3f7;
         }
 
         .copy-btn {
-            background: #4fc3f7;
-            color: #fff;
+            background: var(--primary);
+            color: white;
             border: none;
             border-radius: 6px;
-            padding: 4px 8px;
-            font-size: 15px;
+            padding: 6px 10px;
             cursor: pointer;
-            transition: background 0.2s;
+            transition: background 0.3s;
         }
 
         .copy-btn:hover {
-            background: #2196f3;
+            background: var(--primary-dark);
         }
 
-        .btn-danger {
-            background: linear-gradient(135deg, #f44336, #d32f2f);
+        /* Server Stats */
+        .server-stats-grid {
+            display: grid;
+            grid-template-columns: repeat(auto-fit, minmax(250px, 1fr));
+            gap: 20px;
+            margin: 20px 0;
         }
 
-        .btn-warning {
-            background: linear-gradient(135deg, #ff9800, #f57c00);
+        .server-stat-card {
+            background: var(--card-bg);
+            border-radius: 16px;
+            padding: 20px;
+            text-align: center;
+            border: 1px solid var(--card-border);
         }
 
-        .btn-success {
-            background: linear-gradient(135deg, #4caf50, #388e3c);
+        .server-stat-card .icon {
+            font-size: 2em;
+            margin-bottom: 10px;
         }
 
+        .server-stat-card .value {
+            font-size: 1.5em;
+            font-weight: 700;
+            margin: 10px 0;
+        }
+
+        .server-stat-card .label {
+            color: var(--gray);
+            font-size: 0.9em;
+        }
+
+        .server-progress {
+            height: 8px;
+            background: rgba(255, 255, 255, 0.1);
+            border-radius: 4px;
+            margin: 10px 0;
+            overflow: hidden;
+        }
+
+        .server-progress .progress {
+            height: 100%;
+            border-radius: 4px;
+        }
+
+        .progress.cpu { background: linear-gradient(90deg, #4fc3f7, #2196f3); }
+        .progress.memory { background: linear-gradient(90deg, #66bb6a, #4caf50); }
+        .progress.disk { background: linear-gradient(90deg, #ff9800, #f57c00); }
+        .progress.network { background: linear-gradient(90deg, #9c27b0, #7b1fa2); }
+
+        /* Form Rows */
         .form-row {
             display: grid;
             grid-template-columns: 1fr 1fr;
             gap: 15px;
         }
 
-        .refresh-btn {
-            background: linear-gradient(135deg, #9c27b0, #7b1fa2);
-            width: 328px;
-            padding: 8px 15px;
-            margin-bottom: 15px;
-            margin-right: 493px;
-        }
-
+        /* Admin Sections */
         .admin-section {
             margin: 20px 0;
             padding: 20px;
             background: rgba(255, 255, 255, 0.05);
-            border-radius: 10px;
+            border-radius: 12px;
         }
 
+        /* Search Box */
         .search-box {
             position: relative;
             margin-bottom: 20px;
         }
 
         .search-box input {
-            padding-left: 40px;
+            padding-right: 40px;
         }
 
         .search-icon {
             position: absolute;
-            left: 15px;
+            right: 15px;
             top: 50%;
             transform: translateY(-50%);
-            color: #666;
+            color: var(--gray);
         }
 
+        /* Edit Form */
         .edit-form {
             display: none;
             background: rgba(255, 255, 255, 0.05);
+            padding: 20px;
+            border-radius: 12px;
+            margin: 15px 0;
+        }
+
+        /* Controls */
+        .controls {
+            display: flex;
+            gap: 8px;
+            flex-wrap: wrap;
+            justify-content: center;
+        }
+
+        /* Message Styles */
+        .message {
             padding: 15px;
-            border-radius: 10px;
-            margin: 10px 0;
+            border-radius: 12px;
+            margin: 15px 0;
+            text-align: center;
         }
 
-        @media (max-width: 900px) {
-            .private-key {
-                width: 110px;
-                font-size: 11px;
-            }
-
-            th,
-            td {
-                font-size: 13px;
-                padding: 8px 4px;
-            }
+        .message.error {
+            background: rgba(239, 68, 68, 0.1);
+            border: 1px solid rgba(239, 68, 68, 0.3);
+            color: var(--danger);
         }
 
-        @media (max-width: 768px) {
-
-            .two-column,
-            .form-row {
-                grid-template-columns: 1fr;
-            }
-
-            .header h1 {
-                font-size: 1.8em;
-            }
-
-            .table-container {
-                font-size: 12px;
-            }
+        .message.success {
+            background: rgba(16, 185, 129, 0.1);
+            border: 1px solid rgba(16, 185, 129, 0.3);
+            color: var(--secondary);
         }
 
-        /* Modal for showing full private key */
+        .message.warning {
+            background: rgba(245, 158, 11, 0.1);
+            border: 1px solid rgba(245, 158, 11, 0.3);
+            color: var(--warning);
+        }
+
+        /* Help Text */
+        .help {
+            font-size: 0.9em;
+            color: var(--gray);
+            margin-top: 10px;
+            text-align: center;
+        }
+
+        /* Chart Container */
+        .chart-container {
+            background: rgba(255, 255, 255, 0.05);
+            border-radius: 12px;
+            padding: 20px;
+            margin: 20px 0;
+        }
+
+        .chart-header {
+            margin-bottom: 15px;
+            text-align: center;
+        }
+
+        .chart-header h2 {
+            color: var(--primary);
+            margin: 0;
+        }
+
+        /* Modal */
         .modal-backdrop {
             position: fixed;
             inset: 0;
@@ -3578,113 +4708,1979 @@ $server_stats = get_live_server_stats();
         }
 
         .modal {
-            background: #0f1724;
-            color: #e6eef8;
+            background: var(--darker);
+            color: var(--light);
             border-radius: 12px;
-            max-width: 720px;
+            max-width: 600px;
             width: 100%;
-            padding: 18px;
-            box-shadow: 0 8px 40px rgba(2, 6, 23, 0.6);
-            border: 1px solid rgba(79, 195, 247, 0.12);
+            padding: 20px;
+            box-shadow: 0 10px 25px rgba(0, 0, 0, 0.3);
+            border: 1px solid var(--card-border);
         }
 
-        .modal .modal-header {
+        .modal-header {
             display: flex;
             justify-content: space-between;
             align-items: center;
-            gap: 10px;
-            margin-bottom: 10px;
+            margin-bottom: 15px;
         }
 
-        .modal .modal-body {
-            background: #071021;
-            padding: 12px;
+        .modal-body {
+            background: rgba(15, 23, 42, 0.8);
+            padding: 15px;
             border-radius: 8px;
             font-family: 'Courier New', monospace;
             direction: ltr;
             word-break: break-all;
+            max-height: 300px;
+            overflow-y: auto;
         }
 
-        .modal .modal-actions {
-            margin-top: 12px;
+        .modal-actions {
+            margin-top: 15px;
             display: flex;
-            gap: 8px;
+            gap: 10px;
             justify-content: flex-end;
         }
 
-        .server-stats-grid {
+        /* Footer */
+        .footer {
+            text-align: center;
+            margin-top: 40px;
+            padding: 20px;
+            color: var(--gray);
+            font-size: 0.9em;
+            border-top: 1px solid rgba(255, 255, 255, 0.05);
+        }
+
+        /* App Download Section */
+        .app-download-grid {
             display: grid;
-            grid-template-columns: repeat(auto-fit, minmax(250px, 1fr));
-            gap: 15px;
+            grid-template-columns: repeat(auto-fit, minmax(280px, 1fr));
+            gap: 20px;
             margin: 20px 0;
         }
 
-        .stat-card {
-            background: rgba(255, 255, 255, 0.08);
-            border-radius: 12px;
+        .app-download-card {
+            background: rgba(255, 255, 255, 0.05);
+            border: 1px solid var(--card-border);
+            border-radius: 16px;
             padding: 20px;
-            text-align: center;
-            border: 1px solid rgba(255, 255, 255, 0.1);
+            display: flex;
+            align-items: center;
+            gap: 15px;
+            text-decoration: none;
+            color: var(--light);
             transition: all 0.3s ease;
+            cursor: pointer;
         }
 
-        .stat-card:hover {
-            transform: translateY(-5px);
-            box-shadow: 0 10px 20px rgba(0, 0, 0, 0.2);
+        .app-download-card:hover {
+            background: rgba(255, 255, 255, 0.08);
+            transform: translateY(-3px);
+            box-shadow: 0 8px 20px rgba(0, 0, 0, 0.2);
+            border-color: var(--primary);
         }
 
-        .stat-card .icon {
-            font-size: 2em;
-            margin-bottom: 10px;
+        .app-icon {
+            width: 60px;
+            height: 60px;
+            border-radius: 12px;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            font-size: 28px;
+            background: rgba(99, 102, 241, 0.2);
+            color: var(--primary);
+            flex-shrink: 0;
         }
 
-        .stat-card .value {
-            font-size: 20px;
-            font-weight: bold;
-            margin: 10px 0;
+        .app-info {
+            flex: 1;
         }
 
-        .stat-card .label {
+        .app-info h3 {
+            margin: 0 0 5px 0;
+            font-size: 1.1em;
+            color: var(--light);
+        }
+
+        .app-info p {
+            margin: 0;
+            color: var(--gray);
             font-size: 0.9em;
-            opacity: 0.8;
-            color: #ccc;
         }
 
-        .progress-bar {
-            height: 8px;
-            background: rgba(255, 255, 255, 0.1);
-            border-radius: 4px;
-            margin: 10px 0;
-            overflow: hidden;
+        .app-arrow {
+            font-size: 20px;
+            color: var(--primary);
+            transition: transform 0.3s ease;
         }
 
-        .progress {
-            height: 100%;
-            border-radius: 4px;
-            transition: width 0.5s ease;
+        .app-download-card:hover .app-arrow {
+            transform: translateX(-5px);
         }
 
-        .progress.cpu {
-            background: linear-gradient(90deg, #4fc3f7, #2196f3);
+        /* Responsive */
+        @media (max-width: 768px) {
+            .header {
+                flex-direction: column;
+                gap: 15px;
+                text-align: center;
+            }
+
+            .stats-grid {
+                grid-template-columns: 1fr;
+            }
+
+            .form-row {
+                grid-template-columns: 1fr;
+            }
+
+            .config-actions {
+                flex-direction: column;
+            }
+
+            .tabs {
+                flex-direction: column;
+                gap: 5px;
+            }
+
+            .controls {
+                flex-direction: column;
+            }
+
+            .private-key {
+                width: 120px;
+                font-size: 10px;
+            }
+
+            .app-download-grid {
+                grid-template-columns: 1fr;
+            }
+
+            .app-download-card {
+                padding: 15px;
+            }
+
+            .app-icon {
+                width: 50px;
+                height: 50px;
+                font-size: 24px;
+            }
+
+            .app-info h3 {
+                font-size: 1em;
+            }
         }
 
-        .progress.memory {
-            background: linear-gradient(90deg, #66bb6a, #4caf50);
+        /* Animations */
+        @keyframes fadeIn {
+            from { opacity: 0; transform: translateY(20px); }
+            to { opacity: 1; transform: translateY(0); }
         }
 
-        .progress.disk {
-            background: linear-gradient(90deg, #ff9800, #f57c00);
+        .fade-in {
+            animation: fadeIn 0.5s ease forwards;
         }
 
-        .progress.network {
-            background: linear-gradient(90deg, #9c27b0, #7b1fa2);
+        .delay-1 { animation-delay: 0.1s; }
+        .delay-2 { animation-delay: 0.2s; }
+        .delay-3 { animation-delay: 0.3s; }
+        .delay-4 { animation-delay: 0.4s; }
+
+        /* استایل‌های پیام */
+        .error-message {
+            color: #ef4444;
+            font-weight: bold;
+            margin-top: 10px;
+        }
+
+        .success-message {
+            color: #10b981;
+            font-weight: bold;
+            margin-top: 10px;
+        }
+
+        .modal-backdrop {
+            position: fixed;
+            inset: 0;
+            background: rgba(0, 0, 0, 0.7);
+            display: none;
+            align-items: center;
+            justify-content: center;
+            z-index: 10000;
+            padding: 20px;
+            backdrop-filter: blur(5px);
+        }
+
+        .modal {
+            background: var(--darker);
+            color: var(--light);
+            border-radius: 16px;
+            max-width: 500px;
+            width: 100%;
+            max-height: 90vh;
+            overflow-y: auto;
+            padding: 25px;
+            box-shadow: 0 20px 40px rgba(0, 0, 0, 0.5);
+            border: 1px solid var(--card-border);
+            animation: modalSlideIn 0.3s ease;
+        }
+
+        @keyframes modalSlideIn {
+            from {
+                opacity: 0;
+                transform: translateY(-30px) scale(0.9);
+            }
+            to {
+                opacity: 1;
+                transform: translateY(0) scale(1);
+            }
+        }
+
+        /* Scrollbar */
+        ::-webkit-scrollbar {
+            width: 8px;
+        }
+
+        ::-webkit-scrollbar-track {
+            background: rgba(255, 255, 255, 0.05);
+            border-radius: 10px;
+        }
+
+        ::-webkit-scrollbar-thumb {
+            background: var(--primary);
+            border-radius: 10px;
+        }
+
+        ::-webkit-scrollbar-thumb:hover {
+            background: var(--primary-dark);
+        }
+
+        /* استایل تب‌های مدیریت (admin-tabs) */
+        .admin-tabs {
+            display: flex;
+            background: rgba(15, 23, 42, 0.7);
+            border-radius: 12px;
+            padding: 5px;
+            margin-bottom: 20px;
+            flex-wrap: wrap;
+        }
+
+        .admin-tabs .tab {
+            flex: 1;
+            min-width: 150px;
+            text-align: center;
+            padding: 12px 15px;
+            border-radius: 10px;
+            cursor: pointer;
+            transition: all 0.3s ease;
+            margin: 2px;
+        }
+
+        .admin-tabs .tab.active {
+            background: var(--primary);
+            box-shadow: 0 4px 12px rgba(99, 102, 241, 0.3);
+        }
+
+        .admin-tabs .tab:hover:not(.active) {
+            background: rgba(99, 102, 241, 0.2);
+        }
+
+        .admin-tab-content {
+            display: none;
+            animation: fadeIn 0.5s ease;
+        }
+
+        .admin-tab-content.active {
+            display: block;
+        }
+
+        @media (max-width: 768px) {
+            .admin-tabs {
+                flex-direction: column;
+            }
+            
+            .admin-tabs .tab {
+                min-width: auto;
+            }
         }
     </style>
+</head>
+<body>
+    <div class="container">
+        <!-- Header -->
+        <header class="header fade-in">
+            <div class="logo">
+                <div class="logo-icon">
+                    <i class="fas fa-shield-alt"></i>
+                </div>
+                <div class="logo-text">
+                    <h1>پنل حرفه‌ای WireGuard</h1>
+                    <p>مدیریت پیشرفته کاربران و اتصالات</p>
+                </div>
+            </div>
+            <?php if ($ok && $data): ?>
+            <div style="display: flex; align-items: center; gap: 15px;">
+                <div class="<?php echo $is_admin ? 'admin-badge' : 'user-badge'; ?>">
+                    <i class="fas fa-<?php echo $is_admin ? 'crown' : 'user-check'; ?>"></i>
+                    <span><?php echo $is_admin ? 'دسترسی مدیر' : 'کاربر: ' . h($data['client_name']); ?></span>
+                </div>
+                <a href="<?php echo htmlspecialchars($_SERVER['PHP_SELF']); ?>" class="btn btn-danger" style="padding: 8px 16px; text-decoration: none;">
+                    <i class="fas fa-sign-out-alt"></i> خروج
+                </a>
+            </div>
+            <?php endif; ?>
+        </header>
+
+        <?php if (!$ok || !$data): ?>
+        <!-- Login Card - فقط وقتی لاگین نشده نمایش داده می‌شود -->
+        <div class="card fade-in delay-1">
+            <div class="card-header">
+                <h2 class="card-title"><i class="fas fa-key"></i> احراز هویت</h2>
+            </div>
+            <form method="post" id="loginForm">
+                <div class="form-group">
+                    <input type="text" name="pk" id="pkInput" class="form-input" 
+                           value="<?php echo isset($_POST['pk']) ? h($_POST['pk']) : ''; ?>" 
+                           placeholder="کلید خصوصی خود را اینجا وارد کنید..." 
+                           required 
+                           minlength="40"
+                           pattern="[A-Za-z0-9+/=]+"
+                           title="کلید خصوصی باید حداقل 40 کاراکتر Base64 باشد"
+                           autocomplete="off">
+                </div>
+                <button type="submit" id="loginBtn" class="btn btn-primary btn-block">
+                    <i class="fas fa-sign-in-alt"></i> ورود به پنل
+                </button>
+            </form>
+            <div class="help">
+                PrivateKey را از فایل کانفیگ خود کپی کرده و در فیلد بالا قرار دهید.
+            </div>
+            
+            <?php if (!empty($msg)): ?>
+            <!-- پیغام خطا در همان صفحه ورود -->
+            <div class="message error" style="margin-top: 20px;">
+                <i class="fas fa-exclamation-circle"></i>
+                <?php echo h($msg); ?>
+            </div>
+            <?php endif; ?>
+        </div>
+        <?php endif; ?>
+
+        <?php if ($ok && $data): ?>
+            <?php if ($is_admin): ?>
+    <!-- پنل مدیریت با تب‌ها -->
+    <div class="fade-in delay-2">
+        <!-- تب‌های مدیریت -->
+        <div class="tabs admin-tabs">
+            <div class="tab active" onclick="switchAdminTab('dashboard', event)">
+                <i class="fas fa-tachometer-alt"></i> پیشخوان
+            </div>
+            <div class="tab" onclick="switchAdminTab('users', event)">
+                <i class="fas fa-users-cog"></i> مدیریت کاربران
+            </div>
+            <div class="tab" onclick="switchAdminTab('settings', event)">
+                <i class="fas fa-cogs"></i> تنظیمات سرور
+            </div>
+            <div class="tab" onclick="switchAdminTab('backup', event)">
+                <i class="fas fa-database"></i> پشتیبان‌گیری
+            </div>
+        </div>
+
+        <?php if (!empty($admin_message)): ?>
+            <div class="message <?php echo contains_error($admin_message) ? 'error' : 'success'; ?> fade-in">
+                <?php echo h($admin_message); ?>
+            </div>
+        <?php endif; ?>
+
+        <!-- تب پیشخوان -->
+        <div id="dashboard-tab" class="admin-tab-content active">
+            <!-- اطلاعات سرور -->
+            <div class="admin-section">
+                <h3><i class="fas fa-server"></i> اطلاعات سرور</h3>
+                <div class="stats-grid">
+                    <div class="stat-card">
+                        <div class="stat-icon primary">
+                            <i class="fas fa-network-wired"></i>
+                        </div>
+                        <div class="stat-info">
+                            <div class="stat-value"><?php echo h($server_info['endpoint'] ?? 'N/A'); ?></div>
+                            <div class="stat-label">آدرس سرور</div>
+                        </div>
+                    </div>
+                    <div class="stat-card">
+                        <div class="stat-icon success">
+                            <i class="fas fa-globe"></i>
+                        </div>
+                        <div class="stat-info">
+                            <div class="stat-value"><?php echo h($server_info['dns'] ?? 'N/A'); ?></div>
+                            <div class="stat-label">DNS سرورها</div>
+                        </div>
+                    </div>
+                    <div class="stat-card">
+                        <div class="stat-icon warning">
+                            <i class="fas fa-users"></i>
+                        </div>
+                        <div class="stat-info">
+                            <div class="stat-value"><?php echo count($clients_list); ?></div>
+                            <div class="stat-label">تعداد کاربران</div>
+                        </div>
+                    </div>
+                    <div class="stat-card">
+                        <div class="stat-icon <?php echo ($server_info['status'] === 'active') ? 'success' : 'danger'; ?>">
+                            <i class="fas fa-power-off"></i>
+                        </div>
+                        <div class="stat-info">
+                            <div id="dashboard-service-status" class="stat-value"><?php echo ($server_info['status'] === 'active') ? 'فعال' : 'غیرفعال'; ?></div>
+                            <div class="stat-label">وضعیت سرویس</div>
+                            <button type="button" onclick="updateDashboardServiceStatus()" class="btn btn-info" style="margin-top: 10px; padding: 5px 10px; font-size: 12px;">
+                                <i class="fas fa-sync-alt"></i> بروزرسانی
+                            </button>
+                        </div>
+                    </div>
+                </div>
+            </div>
+
+            <!-- آمار لحظه‌ای سرور -->
+            <div class="card">
+                <div class="card-header">
+                    <h2 class="card-title"><i class="fas fa-chart-bar"></i> آمار لحظه‌ای سرور</h2>
+                </div>
+                <div class="server-stats-grid">
+                    <div class="server-stat-card">
+                        <div class="icon">⚡</div>
+                        <div class="label">مصرف CPU</div>
+                        <div class="value"><?php echo $server_stats['cpu_usage']; ?>%</div>
+                        <div class="server-progress">
+                            <div class="progress cpu" style="width: <?php echo $server_stats['cpu_usage']; ?>%"></div>
+                        </div>
+                    </div>
+                    <div class="server-stat-card">
+                        <div class="icon">🧠</div>
+                        <div class="label">مصرف حافظه</div>
+                        <div class="value"><?php echo $server_stats['memory_usage']; ?>%</div>
+                        <div class="server-progress">
+                            <div class="progress memory" style="width: <?php echo $server_stats['memory_usage']; ?>%"></div>
+                        </div>
+                        <div class="help"><?php echo $server_stats['memory_used']; ?>MB / <?php echo $server_stats['memory_total']; ?>MB</div>
+                    </div>
+                    <div class="server-stat-card">
+                        <div class="icon">💾</div>
+                        <div class="label">مصرف دیسک</div>
+                        <div class="value"><?php echo $server_stats['disk_usage']; ?>%</div>
+                        <div class="server-progress">
+                            <div class="progress disk" style="width: <?php echo $server_stats['disk_usage']; ?>%"></div>
+                        </div>
+                    </div>
+                    <div class="server-stat-card">
+                        <div class="icon">🌐</div>
+                        <div class="label">ترافیک شبکه</div>
+                        <div class="value"><?php echo $server_stats['network_rx']; ?>MB / <?php echo $server_stats['network_tx']; ?>MB</div>
+                        <div class="server-progress">
+                            <div class="progress network" style="width: 50%"></div>
+                        </div>
+                        <div class="help">دانلود / آپلود</div>
+                    </div>
+                </div>
+                <div class="help">
+                    آپ‌تایم سرور: <?php echo $server_stats['uptime']; ?>
+                </div>
+            </div>
+
+            <!-- خلاصه کاربران -->
+            <div class="card">
+                <div class="card-header">
+                    <h2 class="card-title"><i class="fas fa-users"></i> خلاصه کاربران</h2>
+                    <span class="status-badge status-active">
+                        <i class="fas fa-circle"></i>
+                        <?php echo count($clients_list); ?> کاربر
+                    </span>
+                </div>
+                <div class="stats-grid">
+                    <?php
+                    $active_users = array_filter($clients_list, function($client) {
+                        return $client['active'];
+                    });
+                    $inactive_users = array_filter($clients_list, function($client) {
+                        return !$client['active'];
+                    });
+                    $near_limit_users = array_filter($clients_list, function($client) {
+                        return $client['remaining_gb'] !== '∞' && $client['remaining_gb'] < 1 && $client['remaining_gb'] > 0;
+                    });
+                    $expired_users = array_filter($clients_list, function($client) {
+                        return $client['days_remaining'] !== '∞' && $client['days_remaining'] <= 0;
+                    });
+                    ?>
+                    <div class="stat-card">
+                        <div class="stat-icon success">
+                            <i class="fas fa-user-check"></i>
+                        </div>
+                        <div class="stat-info">
+                            <div class="stat-value"><?php echo count($active_users); ?></div>
+                            <div class="stat-label">کاربران فعال</div>
+                        </div>
+                    </div>
+                    <div class="stat-card">
+                        <div class="stat-icon danger">
+                            <i class="fas fa-user-times"></i>
+                        </div>
+                        <div class="stat-info">
+                            <div class="stat-value"><?php echo count($inactive_users); ?></div>
+                            <div class="stat-label">کاربران غیرفعال</div>
+                        </div>
+                    </div>
+                    <div class="stat-card">
+                        <div class="stat-icon warning">
+                            <i class="fas fa-exclamation-triangle"></i>
+                        </div>
+                        <div class="stat-info">
+                            <div class="stat-value"><?php echo count($near_limit_users); ?></div>
+                            <div class="stat-label">نزدیک به پایان سهمیه</div>
+                        </div>
+                    </div>
+                    <div class="stat-card">
+                        <div class="stat-icon danger">
+                            <i class="fas fa-clock"></i>
+                        </div>
+                        <div class="stat-info">
+                            <div class="stat-value"><?php echo count($expired_users); ?></div>
+                            <div class="stat-label">منقضی شده</div>
+                        </div>
+                    </div>
+                </div>
+            </div>
+        </div>
+
+        <!-- تب مدیریت کاربران -->
+        <div id="users-tab" class="admin-tab-content">
+            <div class="admin-section">
+                <h3><i class="fas fa-users-cog"></i> مدیریت کاربران</h3>
+                
+                <div class="stats-grid">
+                    <!-- افزودن کاربر جدید -->
+                    <div class="card">
+                        <div class="card-header">
+                            <h2 class="card-title"><i class="fas fa-user-plus"></i> افزودن کاربر جدید</h2>
+                        </div>
+                        <form method="post">
+                            <input type="hidden" name="pk" id="addUserPk" value="<?php echo h($_POST['pk'] ?? ''); ?>">
+                            <input type="hidden" name="admin_action" value="add-client">
+                            <div class="form-group">
+                                <input type="text" name="param1" id="addUserName" class="form-input" placeholder="نام کاربر" required>
+                            </div>
+                            <div class="form-row">
+                                <input type="number" name="param2" id="addUserGB" class="form-input" placeholder="سهمیه (GB)" min="0" step="0.1" required>
+                                <input type="number" name="param3" id="addUserDays" class="form-input" placeholder="مدت (روز)" min="1" required>
+                            </div>
+                            <button type="button" id="addUserBtn" class="btn btn-success btn-block">افزودن کاربر</button>
+                        </form>
+                        <div id="addUserMsg" style="margin-top:10px;color:#d43f3a;font-weight:bold;"></div>
+                    </div>
+
+                    <!-- ویرایش کاربر -->
+                    <div class="card">
+                        <div class="card-header">
+                            <h2 class="card-title"><i class="fas fa-user-edit"></i> ویرایش کاربر</h2>
+                        </div>
+                        <div id="editForm" class="edit-form" style="display: none;">
+                            <div style="margin-bottom: 15px;">
+                                <label style="display: block; margin-bottom: 5px; font-weight: bold;">نام کاربر:</label>
+                                <input type="text" id="editClientName" class="form-input" readonly style="background: rgba(255,255,255,0.1);">
+                            </div>
+                            <div class="form-row">
+                                <div style="flex: 1;">
+                                    <label style="display: block; margin-bottom: 5px;">سهمیه جدید (GB):</label>
+                                    <input type="number" id="editClientGB" class="form-input" placeholder="سهمیه جدید (GB)" min="0" step="0.1" required>
+                                </div>
+                                <div style="flex: 1;">
+                                    <label style="display: block; margin-bottom: 5px;">مدت جدید (روز):</label>
+                                    <input type="number" id="editClientDays" class="form-input" placeholder="مدت جدید (روز)" min="1" required>
+                                </div>
+                            </div>
+                            <input type="hidden" id="editClientPk" value="<?php echo h($_POST['pk'] ?? ''); ?>">
+                            <div class="controls" style="margin-top: 15px;">
+                                <button type="button" onclick="submitEditClient()" class="btn btn-warning">
+                                    <i class="fas fa-save"></i> ذخیره تغییرات
+                                </button>
+                                <button type="button" onclick="hideEditForm()" class="btn btn-primary">
+                                    <i class="fas fa-times"></i> انصراف
+                                </button>
+                            </div>
+                            <div id="editClientMsg" style="margin-top: 10px;"></div>
+                        </div>
+                        <div class="help">برای ویرایش کاربر، از لیست زیر روی دکمه ویرایش کلیک کنید</div>
+                    </div>
+                </div>
+
+                <!-- جستجو و لیست کاربران -->
+                <div class="card">
+                    <div class="card-header">
+                        <h2 class="card-title"><i class="fas fa-list"></i> لیست کاربران</h2>
+                        <div class="search-box">
+                            <input type="text" id="searchUsers" class="form-input" placeholder="جستجوی کاربر..." onkeyup="searchUsers()">
+                            <span class="search-icon"><i class="fas fa-search"></i></span>
+                        </div>
+                    </div>
+
+                    <div class="table-container">
+                        <table id="clientsTable">
+                            <thead>
+                                <tr>
+                                    <th>نام کاربر</th>
+                                    <th>آدرس IP</th>
+                                    <th>Private Key</th>
+                                    <th>مصرف (GB)</th>
+                                    <th>سقف (GB)</th>
+                                    <th>باقیمانده (GB)</th>
+                                    <th>تاریخ انقضا</th>
+                                    <th>روز باقیمانده</th>
+                                    <th>وضعیت</th>
+                                    <th>عملیات</th>
+                                </tr>
+                            </thead>
+                            <tbody>
+                                <?php if (!empty($clients_list)): ?>
+                                    <?php foreach ($clients_list as $client): ?>
+                                        <tr>
+                                            <td><strong><?php echo h($client['name']); ?></strong></td>
+                                            <td><?php echo h($client['ip']); ?></td>
+                                            <td>
+                                                <div class="key-container">
+                                                    <input type="text" class="private-key" value="<?php echo h($client['private_key']); ?>" readonly>
+                                                    <button class="copy-btn" onclick="copyToClipboard(this)"><i class="fas fa-copy"></i></button>
+                                                    <button class="btn btn-primary" onclick="showKeyModal('<?php echo h($client['private_key']); ?>')" style="padding: 6px 10px;"><i class="fas fa-eye"></i></button>
+                                                </div>
+                                            </td>
+                                            <td><?php echo h($client['used_gb']); ?></td>
+                                            <td><?php echo h($client['limit_gb']); ?></td>
+                                            <td class="<?php echo ($client['remaining_gb'] === '∞' || $client['remaining_gb'] > 0) ? 'success' : 'error'; ?>">
+                                                <strong><?php echo h($client['remaining_gb']); ?></strong>
+                                            </td>
+                                            <td><?php echo h($client['expiry']); ?></td>
+                                            <td class="<?php echo ($client['days_remaining'] === '∞' || $client['days_remaining'] > 7) ? 'success' : (($client['days_remaining'] > 0) ? 'warning' : 'error'); ?>">
+                                                <strong><?php echo h($client['days_remaining']); ?></strong>
+                                            </td>
+                                            <td>
+                                                <span class="status-badge <?php echo $client['active'] ? 'status-active' : 'status-inactive'; ?>">
+                                                    <i class="fas fa-circle"></i>
+                                                    <?php echo $client['active'] ? 'فعال' : 'غیرفعال'; ?>
+                                                </span>
+                                            </td>
+                                            <td>
+                                                <div class="controls">
+                                                    <?php
+                                                    $client_name_escaped = str_replace("'", "\\'", $client['name']);
+                                                    ?>
+                                                    <button type="button" onclick="showEditForm('<?php echo $client_name_escaped; ?>', <?php echo h($client['limit_gb']); ?>, <?php echo ($client['days_remaining'] === '∞' ? 0 : h($client['days_remaining'])); ?>)"
+                                                        class="btn btn-warning" style="padding: 8px 12px;">
+                                                        <i class="fas fa-edit"></i>
+                                                    </button>
+                                                    <button type="button" onclick="if(confirm('آیا از حذف کاربر <?php echo $client_name_escaped; ?> مطمئن هستید؟')) sendAdminAction('remove-client', '<?php echo $client_name_escaped; ?>')" 
+                                                        class="btn btn-danger" style="padding: 8px 12px;">
+                                                        <i class="fas fa-trash"></i>
+                                                    </button>
+                                                </div>
+                                            </td>
+                                        </tr>
+                                    <?php endforeach; ?>
+                                <?php else: ?>
+                                    <tr>
+                                        <td colspan="10" style="text-align:center;padding:20px;">
+                                            <i class="fas fa-users" style="font-size: 2em; margin-bottom: 10px; display: block; color: var(--gray);"></i>
+                                            هیچ کاربری یافت نشد. اولین کاربر را اضافه کنید.
+                                        </td>
+                                    </tr>
+                                <?php endif; ?>
+                            </tbody>
+                        </table>
+                    </div>
+                </div>
+
+                <!-- دکمه رفرش -->
+                <div class="card">
+                    <button type="button" onclick="refreshUserList()" class="btn btn-primary btn-block">
+                        <i class="fas fa-sync-alt"></i> بروزرسانی لیست کاربران
+                    </button>
+                </div>
+            </div>
+        </div>
+
+        <!-- تب تنظیمات سرور -->
+        <div id="settings-tab" class="admin-tab-content">
+            <div class="admin-section">
+                <h3><i class="fas fa-cogs"></i> تنظیمات سرور</h3>
+                
+                <div class="stats-grid">
+                    <!-- تنظیم Endpoint و DNS -->
+                    <div class="card">
+                        <div class="card-header">
+                            <h2 class="card-title"><i class="fas fa-network-wired"></i> تنظیم Endpoint و DNS</h2>
+                        </div>
+                        <form id="endpoint-form" method="post">
+                            <input type="hidden" name="pk" value="<?php echo h($_POST['pk'] ?? ''); ?>">
+                            <input type="hidden" name="admin_action" value="set-endpoint">
+                            <?php
+                            $current_endpoint = $server_info['endpoint'] ?? 'SERVER_IP:1010';
+                            $endpoint_parts = explode(':', $current_endpoint);
+                            $current_domain = $endpoint_parts[0] ?? '';
+                            $current_port = $endpoint_parts[1] ?? '1010';
+                            $current_dns = $server_info['dns'] ?? '1.1.1.1,8.8.8.8';
+                            ?>
+                            <div class="form-group">
+                                <input type="text" id="endpoint-domain" name="param1" class="form-input" placeholder="دامنه یا IP سرور" required value="<?php echo h($current_domain); ?>">
+                            </div>
+                            <div class="form-row">
+                                <input type="number" id="endpoint-port" name="param2" class="form-input" placeholder="پورت" min="1" max="65535" required value="<?php echo h($current_port); ?>">
+                                <input type="text" id="endpoint-dns" name="param3" class="form-input" placeholder="DNS سرورها" required value="<?php echo h($current_dns); ?>">
+                            </div>
+                            <button type="submit" class="btn btn-primary btn-block">بروزرسانی تنظیمات</button>
+                        </form>
+                    </div>
+
+                    <!-- مدیریت سرویس -->
+                    <div class="card">
+                        <div class="card-header">
+                            <h2 class="card-title"><i class="fas fa-power-off"></i> مدیریت سرویس</h2>
+                        </div>
+                        <div class="controls" style="justify-content: center; gap: 15px; padding: 20px;">
+                            <button type="button" onclick="handleServiceAction('start-service')" class="btn btn-success">
+                                <i class="fas fa-play"></i> راه‌اندازی سرویس
+                            </button>
+                            <button type="button" onclick="handleServiceAction('stop-service')" class="btn btn-danger">
+                                <i class="fas fa-stop"></i> توقف سرویس
+                            </button>
+                            <button type="button" onclick="handleServiceAction('restart-service')" class="btn btn-warning">
+                                <i class="fas fa-redo"></i> راه‌اندازی مجدد
+                            </button>
+                            <button type="button" onclick="updateServiceStatus(true)" class="btn btn-info">
+                                <i class="fas fa-sync-alt"></i> بروزرسانی وضعیت
+                            </button>
+                            <button type="button" onclick="forceRefreshStatus()" class="btn btn-secondary" title="بارگذاری مجدد کامل صفحه برای حل مشکل کش">
+                                <i class="fas fa-refresh"></i> رفرش کامل
+                            </button>
+                        </div>
+                        <div class="help" style="text-align: center;">
+                            وضعیت فعلی: 
+                            <span id="service-status-badge" class="status-badge <?php echo ($server_info['status'] === 'active') ? 'status-active' : 'status-inactive'; ?>">
+                                <i class="fas fa-circle"></i>
+                                <span id="service-status-text"><?php echo ($server_info['status'] === 'active') ? 'فعال' : 'غیرفعال'; ?></span>
+                            </span>
+                        </div>
+                    </div>
+                </div>
+            </div>
+        </div>
+
+        <!-- تب پشتیبان‌گیری -->
+        <div id="backup-tab" class="admin-tab-content">
+            <div class="admin-section">
+                <h3><i class="fas fa-database"></i> پشتیبان‌گیری و بازیابی</h3>
+                
+                <div class="stats-grid">
+                    <!-- پشتیبان‌گیری -->
+                    <div class="card">
+                        <div class="card-header">
+                            <h2 class="card-title"><i class="fas fa-download"></i> ایجاد پشتیبان</h2>
+                        </div>
+                        <div style="padding: 20px; text-align: center;">
+                            <p style="margin-bottom: 20px; color: var(--gray);">
+                                با ایجاد پشتیبان، تمام اطلاعات کاربران، تنظیمات سرور و کلیدها در یک فایل ذخیره می‌شوند.
+                            </p>
+                            <div style="display: flex; gap: 10px; justify-content: center; flex-wrap: wrap;">
+                                <form method="post" style="display: inline-block;">
+                                    <input type="hidden" name="pk" value="<?php echo h($_POST['pk'] ?? ''); ?>">
+                                    <input type="hidden" name="admin_action" value="backup">
+                                    <button type="submit" class="btn btn-success" style="min-width: 200px;">
+                                        <i class="fas fa-download"></i> ایجاد و دانلود فوری
+                                    </button>
+                                </form>
+                                <form method="post" style="display: inline-block;">
+                                    <input type="hidden" name="pk" value="<?php echo h($_POST['pk'] ?? ''); ?>">
+                                    <input type="hidden" name="admin_action" value="create-backup-only">
+                                    <button type="submit" class="btn btn-primary" style="min-width: 200px;">
+                                        <i class="fas fa-save"></i> ایجاد و ذخیره در سرور
+                                    </button>
+                                </form>
+                            </div>
+                        </div>
+                    </div>
+
+                    <!-- بازیابی -->
+                    <div class="card">
+                        <div class="card-header">
+                            <h2 class="card-title"><i class="fas fa-upload"></i> بازیابی پشتیبان</h2>
+                        </div>
+                        <div style="padding: 20px;">
+                            <p style="margin-bottom: 20px; color: var(--gray); text-align: center;">
+                                توجه: بازیابی پشتیبان باعث جایگزینی تمام تنظیمات فعلی خواهد شد.
+                            </p>
+                            <form method="post" enctype="multipart/form-data">
+                                <input type="hidden" name="pk" value="<?php echo h($_POST['pk'] ?? ''); ?>">
+                                <input type="hidden" name="admin_action" value="restore">
+                                <div class="form-group">
+                                    <label class="form-label">انتخاب فایل پشتیبان:</label>
+                                    <input type="file" name="backup_file" class="form-input" accept=".tar.gz,.gz" required>
+                                </div>
+                                <button type="submit" class="btn btn-warning btn-block">
+                                    <i class="fas fa-upload"></i> بازیابی پشتیبان
+                                </button>
+                            </form>
+                        </div>
+                    </div>
+                </div>
+
+                <!-- لیست پشتیبان‌های ذخیره شده -->
+                <div class="card">
+                    <div class="card-header">
+                        <h2 class="card-title"><i class="fas fa-history"></i> پشتیبان‌های ذخیره شده</h2>
+                    </div>
+                    <div style="padding: 20px;">
+                        <?php if (!empty($backup_list)): ?>
+                            <div class="table-responsive">
+                                <table class="clients-table">
+                                    <thead>
+                                        <tr>
+                                            <th style="width: 40%;">نام فایل</th>
+                                            <th style="width: 25%;">تاریخ ایجاد</th>
+                                            <th style="width: 20%;">حجم</th>
+                                            <th style="width: 15%;">عملیات</th>
+                                        </tr>
+                                    </thead>
+                                    <tbody>
+                                        <?php foreach ($backup_list as $backup): ?>
+                                            <tr>
+                                                <td>
+                                                    <code style="font-size: 12px;"><?php echo h($backup['filename']); ?></code>
+                                                </td>
+                                                <td><?php echo h($backup['date']); ?></td>
+                                                <td><?php echo h($backup['size_formatted']); ?></td>
+                                                <td>
+                                                    <form method="post" style="display: inline-block;">
+                                                        <input type="hidden" name="pk" value="<?php echo h($_POST['pk'] ?? ''); ?>">
+                                                        <input type="hidden" name="admin_action" value="download-backup">
+                                                        <input type="hidden" name="filename" value="<?php echo h($backup['filename']); ?>">
+                                                        <button type="submit" class="btn btn-sm btn-success" title="دانلود پشتیبان">
+                                                            <i class="fas fa-download"></i>
+                                                        </button>
+                                                    </form>
+                                                </td>
+                                            </tr>
+                                        <?php endforeach; ?>
+                                    </tbody>
+                                </table>
+                            </div>
+                        <?php else: ?>
+                            <div class="help" style="text-align: center; padding: 40px; color: var(--gray);">
+                                <i class="fas fa-inbox" style="font-size: 48px; margin-bottom: 15px; opacity: 0.5;"></i>
+                                <p>هنوز پشتیبانی ایجاد نشده است.</p>
+                                <p style="font-size: 14px;">با کلیک روی "ایجاد پشتیبان کامل" اولین پشتیبان خود را بسازید.</p>
+                            </div>
+                        <?php endif; ?>
+                    </div>
+                </div>
+
+                <!-- اطلاعات پشتیبان -->
+                <div class="card">
+                    <div class="card-header">
+                        <h2 class="card-title"><i class="fas fa-info-circle"></i> اطلاعات پشتیبان</h2>
+                    </div>
+                    <div style="padding: 20px;">
+                        <div class="help">
+                            <strong>موارد موجود در پشتیبان:</strong>
+                            <ul style="margin: 10px 0; padding-right: 20px; color: var(--gray);">
+                                <li>لیست کاربران (clients.db)</li>
+                                <li>سهمیه کاربران (quota.db)</li>
+                                <li>تنظیمات مدیر (admin.db)</li>
+                                <li>آدرس سرور (endpoint.db)</li>
+                                <li>تنظیمات DNS (dns.db)</li>
+                                <li>پیکربندی سرور (وg0.conf)</li>
+                                <li>کلیدهای سرور (server_public.key, server_private.key)</li>
+                                <li>کلیدهای خصوصی کاربران (پوشه clients)</li>
+                            </ul>
+                        </div>
+                    </div>
+                </div>
+            </div>
+        </div>
+    </div>
+
+    <!-- Modal نمایش اطلاعات کاربر جدید -->
+    <div id="addUserModal" class="modal-backdrop" style="display:none;">
+        <div class="modal" style="max-width:500px;">
+            <h3 style="margin-bottom:10px;">اطلاعات کاربر جدید</h3>
+            <div id="addUserModalContent"></div>
+            <button onclick="document.getElementById('addUserModal').style.display='none'" class="btn btn-primary" style="margin-top:15px;">بستن</button>
+        </div>
+    </div>
+
     <script>
+        // تابع تغییر تب‌های مدیریت
+        function switchAdminTab(tabName, evt) {
+            if (!tabName) {
+                console.error('switchAdminTab: tabName is required');
+                return;
+            }
+            
+            // Hide all admin tab contents
+            document.querySelectorAll('.admin-tab-content').forEach(tab => {
+                tab.classList.remove('active');
+            });
+
+            // Remove active class from all admin tabs
+            document.querySelectorAll('.admin-tabs .tab').forEach(tab => {
+                tab.classList.remove('active');
+            });
+
+            // Show selected tab content
+            const content = document.getElementById(tabName + '-tab');
+            if (content) {
+                content.classList.add('active');
+            } else {
+                console.error('switchAdminTab: tab content not found for', tabName);
+            }
+
+            // Activate selected tab
+            if (evt) {
+                const el = evt.currentTarget || evt.target;
+                if (el && el.classList) {
+                    el.classList.add('active');
+                }
+            }
+        }
+
+        // مدیریت افزودن کاربر با AJAX
+        document.addEventListener('DOMContentLoaded', function() {
+            initializeAddUser();
+        });
+
+        function initializeAddUser() {
+            const addUserBtn = document.getElementById('addUserBtn');
+            if (!addUserBtn) {
+                console.warn('Add user button not found');
+                return;
+            }
+            
+            addUserBtn.addEventListener('click', function() {
+                const nameElem = document.getElementById('addUserName');
+                const gbElem = document.getElementById('addUserGB');
+                const daysElem = document.getElementById('addUserDays');
+                const pkElem = document.getElementById('addUserPk');
+                
+                if (!nameElem || !gbElem || !daysElem || !pkElem) {
+                    showMessage('خطا در پیدا کردن فیلدهای فرم', 'error');
+                    return;
+                }
+                
+                const name = nameElem.value.trim();
+                const gb = parseFloat(gbElem.value);
+                const days = parseInt(daysElem.value);
+                const pk = pkElem.value;
+                
+                // اعتبارسنجی پیشرفته
+                if (!validateAddUserForm(name, gb, days)) {
+                    return;
+                }
+                
+                addUser(name, gb, days, pk);
+            });
+        }
+
+        function validateAddUserForm(name, gb, days) {
+            const msgElem = document.getElementById('addUserMsg');
+            
+            if (!name || isNaN(gb) || isNaN(days)) {
+                showFieldMessage('لطفا تمام فیلدها را پر کنید', 'error');
+                return false;
+            }
+            
+            if (name.length < 2 || name.length > 32) {
+                showFieldMessage('نام کاربر باید بین ۲ تا ۳۲ کاراکتر باشد', 'error');
+                return false;
+            }
+            
+            // بررسی نام کاربر (فقط حروف، اعداد و زیرخط)
+            if (!/^[a-zA-Z0-9_\-\.]+$/.test(name)) {
+                showFieldMessage('نام کاربر فقط می‌تواند شامل حروف انگلیسی، اعداد و - _ . باشد', 'error');
+                return false;
+            }
+            
+            if (gb < 0.1 || gb > 1000) {
+                showFieldMessage('سهمیه باید بین ۰.۱ تا ۱۰۰۰ گیگابایت باشد', 'error');
+                return false;
+            }
+            
+            if (days < 1 || days > 3650) {
+                showFieldMessage('مدت اعتبار باید بین ۱ تا ۳۶۵۰ روز باشد', 'error');
+                return false;
+            }
+            
+            showFieldMessage('', 'success');
+            return true;
+        }
+
+        function showFieldMessage(message, type) {
+            const msgElem = document.getElementById('addUserMsg');
+            if (!msgElem) return;
+            
+            msgElem.textContent = message;
+            msgElem.className = type === 'error' ? 'error-message' : 'success-message';
+            msgElem.style.color = type === 'error' ? '#ef4444' : '#10b981';
+            msgElem.style.fontWeight = 'bold';
+            msgElem.style.marginTop = '10px';
+        }
+
+        function addUser(name, gb, days, pk) {
+            const btn = document.getElementById('addUserBtn');
+            const originalText = btn.innerHTML;
+            
+            btn.innerHTML = '<i class="fas fa-spinner fa-spin"></i> در حال افزودن...';
+            btn.disabled = true;
+            
+            const formData = new FormData();
+            formData.append('pk', pk);
+            formData.append('admin_action', 'add-client');
+            formData.append('param1', name);
+            formData.append('param2', gb);
+            formData.append('param3', days);
+            
+            fetch(window.location.href, {
+                method: 'POST',
+                headers: { 
+                    'Accept': 'application/json',
+                    'X-Requested-With': 'XMLHttpRequest'
+                },
+                body: formData
+            })
+            .then(response => {
+                if (!response.ok) {
+                    throw new Error(`خطای شبکه: ${response.status}`);
+                }
+                // بررسی content-type
+                const contentType = response.headers.get('content-type');
+                if (!contentType || !contentType.includes('application/json')) {
+                    console.error('Response is not JSON, content-type:', contentType);
+                    return response.text().then(text => {
+                        console.error('Response body:', text.substring(0, 500));
+                        throw new Error('سرور پاسخ JSON ارسال نکرد. احتمالاً خطای PHP وجود دارد.');
+                    });
+                }
+                return response.json();
+            })
+            .then(data => {
+                if (data.status === 'success') {
+                    showFieldMessage('کاربر با موفقیت اضافه شد', 'success');
+                    resetAddUserForm();
+                    showUserDetailsModal(data);
+                    setTimeout(refreshUserList, 1500);
+                } else {
+                    throw new Error(data.message || 'خطای ناشناخته در افزودن کاربر');
+                }
+            })
+            .catch(error => {
+                console.error('Add user error:', error);
+                showFieldMessage('خطا در افزودن کاربر: ' + error.message, 'error');
+            })
+            .finally(() => {
+                btn.innerHTML = originalText;
+                btn.disabled = false;
+            });
+        }
+
+        function resetAddUserForm() {
+            const nameElem = document.getElementById('addUserName');
+            const gbElem = document.getElementById('addUserGB');
+            const daysElem = document.getElementById('addUserDays');
+            
+            if (nameElem) nameElem.value = '';
+            if (gbElem) gbElem.value = '';
+            if (daysElem) daysElem.value = '';
+        }
+
+        // تابع بهبود یافته برای نمایش مدال کاربر جدید
+        function showUserDetailsModal(userData) {
+            const modal = document.getElementById('addUserModal');
+            const modalContent = document.getElementById('addUserModalContent');
+            
+            if (!modal || !modalContent) {
+                console.error('Modal elements not found');
+                showMessage('خطا در نمایش اطلاعات کاربر', 'error');
+                return;
+            }
+            
+            // ایجاد محتوای مدال
+            modalContent.innerHTML = `
+                <div style="background: rgba(16, 185, 129, 0.1); padding: 20px; border-radius: 12px; margin-bottom: 20px; border: 1px solid rgba(16, 185, 129, 0.3);">
+                    <h4 style="color: #10b981; margin-bottom: 15px; text-align: center;">
+                        <i class="fas fa-check-circle"></i> کاربر با موفقیت ایجاد شد
+                    </h4>
+                    <div style="display: grid; grid-template-columns: 1fr 1fr; gap: 10px;">
+                        <div><strong>نام کاربر:</strong> ${escapeHtml(userData.name)}</div>
+                        <div><strong>آدرس IP:</strong> ${escapeHtml(userData.ip || 'در حال انتساب...')}</div>
+                        <div><strong>سهمیه:</strong> ${userData.param2 || 'N/A'} GB</div>
+                        <div><strong>مدت اعتبار:</strong> ${userData.param3 || 'N/A'} روز</div>
+                    </div>
+                </div>
+                
+                <div style="margin-bottom: 20px;">
+                    <label style="font-weight: bold; display: block; margin-bottom: 8px; color: var(--primary);">
+                        <i class="fas fa-key"></i> کلید خصوصی (Private Key):
+                    </label>
+                    <div style="position: relative;">
+                        <textarea 
+                            id="privateKeyText" 
+                            style="width: 100%; height: 80px; background: rgba(15, 23, 42, 0.9); color: #e2e8f0; border: 1px solid rgba(99, 102, 241, 0.5); border-radius: 8px; padding: 12px; font-family: 'Courier New', monospace; font-size: 12px; line-height: 1.4; resize: vertical;" 
+                            readonly
+                        >${escapeHtml(userData.private_key || '')}</textarea>
+                        <button 
+                            onclick="copyPrivateKey()" 
+                            class="btn btn-primary" 
+                            style="position: absolute; left: 10px; top: 10px; padding: 6px 12px; font-size: 12px;"
+                        >
+                            <i class="fas fa-copy"></i> کپی
+                        </button>
+                    </div>
+                </div>
+                
+                ${userData.qr && userData.qr.length > 0 ? `
+                <div style="text-align: center; margin: 20px 0; padding: 20px; background: rgba(255, 255, 255, 0.05); border-radius: 12px;">
+                    <h4 style="margin-bottom: 15px; color: var(--primary);">
+                        <i class="fas fa-qrcode"></i> QR Code برای اتصال سریع
+                    </h4>
+                    <img src="data:image/png;base64,${userData.qr}" alt="QR Code" style="max-width: 220px; border-radius: 8px; border: 2px solid rgba(255, 255, 255, 0.1);">
+                    <p style="margin-top: 10px; color: var(--gray); font-size: 0.9em;">
+                        این QR Code را در اپلیکیشن موبایل WireGuard اسکن کنید
+                    </p>
+                </div>
+                ` : `
+                <div id="qr-container" style="text-align: center; margin: 20px 0; padding: 20px; background: rgba(255, 255, 255, 0.05); border-radius: 12px;">
+                    <h4 style="margin-bottom: 15px; color: var(--primary);">
+                        <i class="fas fa-qrcode"></i> QR Code برای اتصال سریع
+                    </h4>
+                    <div id="qr-placeholder">
+                        <i class="fas fa-spinner fa-spin" style="font-size: 32px; color: var(--primary);"></i>
+                        <p style="margin-top: 10px; color: var(--gray);">در حال تولید QR Code...</p>
+                    </div>
+                </div>
+                `}
+                
+                <div style="margin-top: 20px; text-align: center;">
+                    <button onclick="downloadUserConfig('${escapeHtml(userData.name)}', '${escapeHtml(userData.private_key || '')}', '${escapeHtml(userData.ip || '')}')" class="btn btn-success">
+                        <i class="fas fa-download"></i> دانلود فایل کانفیگ
+                    </button>
+                </div>
+            `;
+            
+            // نمایش مدال
+            modal.style.display = 'flex';
+            
+            // اگر QR وجود نداشت، سعی کنیم از روش دیگری تولید کنیم
+            if (!userData.qr || userData.qr.length === 0) {
+                generateQRCodeFallback(userData);
+            }
+        }
+
+        // تابع جایگزین برای تولید QR Code
+        function generateQRCodeFallback(userData) {
+            if (!userData.private_key || !userData.ip) {
+                document.getElementById('qr-placeholder').innerHTML = `
+                    <i class="fas fa-exclamation-triangle" style="color: #f59e0b; font-size: 24px;"></i>
+                    <p style="color: #f59e0b; margin-top: 10px;">اطلاعات ناقص برای تولید QR Code</p>
+                `;
+                return;
+            }
+            
+            const configContent = generateConfigFile(userData.name, userData.private_key, userData.ip);
+            
+            // استفاده از API آنلاین برای تولید QR
+            const apiUrl = 'https://api.qrserver.com/v1/create-qr-code/?size=300x300&format=png&data=' + encodeURIComponent(configContent);
+            
+            const qrPlaceholder = document.getElementById('qr-placeholder');
+            if (qrPlaceholder) {
+                qrPlaceholder.innerHTML = `
+                    <img src="${apiUrl}" 
+                         alt="QR Code" 
+                         style="max-width: 220px; border-radius: 8px; border: 2px solid rgba(255, 255, 255, 0.1);"
+                         onerror="handleQRError()"
+                    >
+                    <p style="margin-top: 10px; color: var(--gray); font-size: 0.9em;">
+                        این QR Code را در اپلیکیشن موبایل WireGuard اسکن کنید
+                    </p>
+                `;
+            }
+        }
+
+        // مدیریت خطا در بارگذاری QR
+        function handleQRError() {
+            const qrPlaceholder = document.getElementById('qr-placeholder');
+            if (qrPlaceholder) {
+                qrPlaceholder.innerHTML = `
+                    <i class="fas fa-times-circle" style="color: #ef4444; font-size: 24px;"></i>
+                    <p style="color: #ef4444; margin-top: 10px;">خطا در تولید QR Code</p>
+                    <p style="color: var(--gray); font-size: 0.85em; margin-top: 5px;">لطفاً از دانلود فایل کانفیگ استفاده کنید</p>
+                `;
+            }
+        }
+
+        // تابع برای کپی کلید خصوصی
+        function copyPrivateKey() {
+            const textarea = document.getElementById('privateKeyText');
+            if (!textarea) return;
+            
+            const key = textarea.value.trim();
+            if (!key) {
+                showMessage('کلید خصوصی موجود نیست', 'error');
+                return;
+            }
+            
+            navigator.clipboard.writeText(key).then(() => {
+                showMessage('کلید خصوصی کپی شد', 'success');
+            }).catch(err => {
+                console.error('Copy failed:', err);
+                showMessage('خطا در کپی کلید', 'error');
+            });
+        }
+
+        // تابع برای دانلود کانفیگ
+        function downloadUserConfig(username, privateKey, ip) {
+            if (!privateKey || !ip) {
+                showMessage('اطلاعات کاربر ناقص است', 'error');
+                return;
+            }
+            
+            const config = generateConfigFile(username, privateKey, ip);
+            const blob = new Blob([config], { type: 'text/plain' });
+            const url = URL.createObjectURL(blob);
+            const a = document.createElement('a');
+            
+            a.href = url;
+            a.download = `${username}.conf`;
+            document.body.appendChild(a);
+            a.click();
+            document.body.removeChild(a);
+            URL.revokeObjectURL(url);
+            
+            showMessage('فایل کانفیگ دانلود شد', 'success');
+        }
+
+        // تابع برای تولید محتوای فایل کانفیگ
+        function generateConfigFile(username, privateKey, ip) {
+            // این اطلاعات باید از سرور گرفته شوند
+            const serverPublicKey = '<?php echo h($server_info['public_key'] ?? 'SERVER_PUBLIC_KEY'); ?>';
+            const serverEndpoint = '<?php echo h($server_info['endpoint'] ?? 'SERVER_IP:1010'); ?>';
+            const dns = '<?php echo h($server_info['dns'] ?? '1.1.1.1,8.8.8.8'); ?>';
+            
+            return `[Interface]
+PrivateKey = ${privateKey}
+Address = ${ip}/24
+DNS = ${dns}
+MTU = 1420
+
+[Peer]
+PublicKey = ${serverPublicKey}
+Endpoint = ${serverEndpoint}
+AllowedIPs = 0.0.0.0/0, ::/0
+PersistentKeepalive = 25`;
+        }
+
+        // تابع برای escape کردن HTML
+        function escapeHtml(unsafe) {
+            if (typeof unsafe !== 'string') return unsafe;
+            return unsafe
+                .replace(/&/g, "&amp;")
+                .replace(/</g, "&lt;")
+                .replace(/>/g, "&gt;")
+                .replace(/"/g, "&quot;")
+                .replace(/'/g, "&#039;");
+        }
+    </script>
+
+            <?php else: ?>
+                <!-- پنل کاربر عادی -->
+                <?php
+                $__tmp = get_weekly_usage($data['client_name'] ?? '');
+                echo '<script>window.USER_USAGE=' . json_encode($__tmp, JSON_UNESCAPED_UNICODE|JSON_UNESCAPED_SLASHES) . ';</script>';
+                ?>
+                
+                <div class="fade-in delay-2">
+                    <!-- آمار مصرف -->
+                    <div class="stats-grid">
+                        <div class="stat-card">
+                            <div class="stat-icon primary">
+                                <i class="fas fa-network-wired"></i>
+                            </div>
+                            <div class="stat-info">
+                                <div class="stat-value"><?php echo h($data['ip_address']); ?></div>
+                                <div class="stat-label">آدرس IP</div>
+                            </div>
+                        </div>
+                        <div class="stat-card">
+                            <div class="stat-icon success">
+                                <i class="fas fa-database"></i>
+                            </div>
+                            <div class="stat-info">
+                                <div class="stat-value"><?php echo h($data['data_used']); ?> GB</div>
+                                <div class="stat-label">مصرف شده</div>
+                            </div>
+                        </div>
+                        <div class="stat-card">
+                            <div class="stat-icon warning">
+                                <i class="fas fa-tachometer-alt"></i>
+                            </div>
+                            <div class="stat-info">
+                                <div class="stat-value"><?php echo h($data['remaining_data']); ?> GB</div>
+                                <div class="stat-label">باقیمانده</div>
+                            </div>
+                        </div>
+                        <div class="stat-card">
+                            <div class="stat-icon primary">
+                                <i class="fas fa-calendar-day"></i>
+                            </div>
+                            <div class="stat-info">
+                                <div class="stat-value"><?php echo h($data['days_remaining']); ?> روز</div>
+                                <div class="stat-label">اعتبار باقیمانده</div>
+                            </div>
+                        </div>
+                    </div>
+
+                    <!-- درصد مصرف -->
+                    <div class="card usage-card fade-in delay-3">
+                        <div class="usage-header">
+                            <h2 class="card-title"><i class="fas fa-chart-pie"></i> وضعیت مصرف</h2>
+                            <div class="usage-percent"><?php echo h($data['usage_percent']); ?>%</div>
+                        </div>
+                        <div class="progress-container">
+                            <div class="progress-bar" style="width: <?php echo max(0, min(100, floatval($data['usage_percent']))); ?>%"></div>
+                        </div>
+                        <div class="usage-details">
+                            <span>0 GB</span>
+                            <span><?php echo h($data['data_limit']); ?> GB</span>
+                        </div>
+                    </div>
+
+                    <!-- نمودار مصرف -->
+                    <div class="card fade-in delay-3">
+                        <div class="chart-container">
+                            <div class="chart-header">
+                                <h2><i class="fas fa-chart-line"></i> نمودار مصرف هفتگی</h2>
+                            </div>
+                            <div style="height:300px;position:relative">
+                                <canvas id="usageChart"></canvas>
+                            </div>
+                        </div>
+                    </div>
+
+                    <!-- تب‌ها -->
+                    <div class="tabs fade-in delay-4">
+                        <div class="tab active" onclick="switchTab('config', event)">
+                            <i class="fas fa-file-code"></i> اطلاعات کانفیگ
+                        </div>
+                        <div class="tab" onclick="switchTab('qr', event)">
+                            <i class="fas fa-qrcode"></i> QR Code
+                        </div>
+                    </div>
+
+                    <!-- محتوای تب‌ها -->
+                    <div id="config-tab" class="tab-content active">
+                        <div class="card">
+                            <div class="card-header">
+                                <h2 class="card-title"><i class="fas fa-file-code"></i> پیکربندی اتصال</h2>
+                                <span class="status-badge <?php echo ($data['is_active'] ? 'status-active' : 'status-inactive'); ?>">
+                                    <i class="fas fa-circle"></i>
+                                    <?php echo ($data['is_active'] ? 'فعال' : 'غیرفعال'); ?>
+                                </span>
+                            </div>
+                            <div class="config-container">
+                                <div class="config-content">[Interface]<br>
+PrivateKey = <?php echo h($_POST['pk'] ?? ''); ?><br>
+Address = <?php echo h($data['ip_address']); ?>/24<br>
+DNS = <?php echo h($data['server_dns'] ?? '1.1.1.1,8.8.8.8'); ?><br>
+MTU = 1420<br>
+
+[Peer]<br>
+PublicKey = <?php echo h($data['server_public_key']); ?><br>
+Endpoint = <?php echo h($data['server_endpoint']); ?><br>
+AllowedIPs = 0.0.0.0/0, ::/0<br>
+PersistentKeepalive = 25</div>
+                                <div class="config-actions">
+                                    <form method="post" style="flex: 1;" id="downloadConfigForm">
+                                        <input type="hidden" name="pk" value="<?php echo h($data['private_key'] ?? ''); ?>">
+                                        <input type="hidden" name="user_action" value="download-config">
+                                        <button type="submit" class="btn btn-success">
+                                            <i class="fas fa-download"></i> دانلود فایل کانفیگ
+                                        </button>
+                                    </form>
+                                    <button class="btn btn-primary" onclick="copyConfig(event)">
+                                        <i class="fas fa-copy"></i> کپی کانفیگ
+                                    </button>
+                                </div>
+                            </div>
+                        </div>
+                    </div>
+
+                    <!-- بخش دانلود اپلیکیشن -->
+                    <div class="card fade-in delay-4">
+                        <div class="card-header">
+                            <h2 class="card-title"><i class="fas fa-mobile-alt"></i> دانلود اپلیکیشن WireGuard</h2>
+                        </div>
+                        <p style="text-align: center; color: var(--gray); margin-bottom: 20px;">
+                            برای استفاده از WireGuard روی موبایل، اپلیکیشن رسمی را از استورهای زیر دانلود کنید
+                        </p>
+                        <div class="app-download-grid">
+                            <a href="https://play.google.com/store/apps/details?id=com.wireguard.android&hl=en" target="_blank" class="app-download-card">
+                                <div class="app-icon">
+                                    <i class="fab fa-android"></i>
+                                </div>
+                                <div class="app-info">
+                                    <h3>WireGuard (رسمی)</h3>
+                                    <p>Android - Google Play</p>
+                                </div>
+                                <div class="app-arrow">
+                                    <i class="fas fa-arrow-left"></i>
+                                </div>
+                            </a>
+                            
+                            <a href="https://play.google.com/store/apps/details?id=com.zaneschepke.wireguardautotunnel&hl=en" target="_blank" class="app-download-card">
+                                <div class="app-icon" style="background: rgba(76, 175, 80, 0.2); color: #4caf50;">
+                                    <i class="fab fa-android"></i>
+                                </div>
+                                <div class="app-info">
+                                    <h3>WireGuard Auto Tunnel</h3>
+                                    <p>Android - اتصال خودکار</p>
+                                </div>
+                                <div class="app-arrow">
+                                    <i class="fas fa-arrow-left"></i>
+                                </div>
+                            </a>
+                            
+                            <a href="https://apps.apple.com/us/app/wireguard/id1441195209" target="_blank" class="app-download-card">
+                                <div class="app-icon" style="background: rgba(0, 122, 255, 0.2); color: #007aff;">
+                                    <i class="fab fa-apple"></i>
+                                </div>
+                                <div class="app-info">
+                                    <h3>WireGuard (رسمی)</h3>
+                                    <p>iOS - App Store</p>
+                                </div>
+                                <div class="app-arrow">
+                                    <i class="fas fa-arrow-left"></i>
+                                </div>
+                            </a>
+                        </div>
+                        <div class="help" style="margin-top: 15px;">
+                            💡 پس از نصب اپلیکیشن، می‌توانید با اسکن QR Code یا آپلود فایل کانفیگ، به سرویس متصل شوید
+                        </div>
+                    </div>
+
+                    <div id="qr-tab" class="tab-content">
+                        <div class="card qr-section">
+                            <div class="card-header">
+                                <h2 class="card-title"><i class="fas fa-qrcode"></i> اتصال سریع با QR Code</h2>
+                            </div>
+                            <?php if (!empty($qr_code)): ?>
+                            <div class="qr-container">
+                                <img src="data:image/png;base64,<?php echo $qr_code; ?>" alt="QR Code" class="qr-image">
+                            </div>
+                            <p>با اسکن این QR Code در اپلیکیشن WireGuard، به صورت خودکار متصل شوید</p>
+                            <?php else: ?>
+                            <div class="message warning">
+                                <i class="fas fa-exclamation-triangle"></i>
+                                تولید QR Code با مشکل مواجه شد. لطفاً از فایل کانفیگ استفاده کنید.
+                            </div>
+                            <?php endif; ?>
+                        </div>
+                    </div>
+                </div>
+            <?php endif; ?>
+
+        <?php endif; ?>
+
+        <!-- Footer -->
+        <footer class="footer fade-in delay-4">
+            <p>پنل مدیریت WireGuard • نسخه ۲.۰ • طراحی حرفه‌ای</p>
+        </footer>
+    </div>
+
+    <!-- Modal for displaying full private key -->
+    <div id="keyModalBackdrop" class="modal-backdrop" onclick="closeKeyModal()">
+        <div class="modal" onclick="event.stopPropagation()">
+            <div class="modal-header">
+                <h3><i class="fas fa-key"></i> کلید خصوصی (Private Key)</h3>
+                <button onclick="closeKeyModal()" class="btn btn-danger" style="padding: 8px 12px;">
+                    <i class="fas fa-times"></i>
+                </button>
+            </div>
+            <div id="keyModalBody" class="modal-body">-----</div>
+            <div class="modal-actions">
+                <button class="btn btn-primary" onclick="copyModalKey()">
+                    <i class="fas fa-copy"></i> کپی کلید
+                </button>
+                <button class="btn" onclick="closeKeyModal()">بستن</button>
+            </div>
+        </div>
+    </div>
+
+    <script>
+        // Tab switching functionality
+        function switchTab(tabName, evt) {
+            if (!tabName) {
+                console.error('switchTab: tabName is required');
+                return;
+            }
+            
+            // Hide all tab contents
+            document.querySelectorAll('.tab-content').forEach(tab => {
+                tab.classList.remove('active');
+            });
+
+            // Remove active class from all tabs
+            document.querySelectorAll('.tab').forEach(tab => {
+                tab.classList.remove('active');
+            });
+
+            // Show selected tab content
+            const content = document.getElementById(tabName + '-tab');
+            if (content) {
+                content.classList.add('active');
+            } else {
+                console.error('switchTab: tab content not found for', tabName);
+            }
+
+            // Activate selected tab
+            if (evt) {
+                const el = evt.currentTarget || evt.target;
+                if (el && el.classList) {
+                    el.classList.add('active');
+                }
+            }
+        }
+
+        // Copy config to clipboard
+        function copyConfig(evt) {
+            const configText = `[Interface]
+PrivateKey = <?php echo h($_POST['pk'] ?? ''); ?>
+Address = <?php echo h($data['ip_address'] ?? '10.0.0.2'); ?>/24
+DNS = <?php echo h($data['server_dns'] ?? '1.1.1.1,8.8.8.8'); ?>
+MTU = 1420
+
+[Peer]
+PublicKey = <?php echo h($data['server_public_key'] ?? ''); ?>
+Endpoint = <?php echo h($data['server_endpoint'] ?? 'SERVER_IP:1010'); ?>
+AllowedIPs = 0.0.0.0/0, ::/0
+PersistentKeepalive = 25`;
+
+            let btn = null;
+            if (evt && evt.target) {
+                btn = evt.target.closest('button') || evt.target;
+            } else if (evt && evt.currentTarget) {
+                btn = evt.currentTarget;
+            }
+
+            const showSuccess = () => {
+                if (btn) {
+                    const originalText = btn.innerHTML;
+                    btn.innerHTML = '<i class="fas fa-check"></i> کپی شد!';
+                    btn.style.background = 'linear-gradient(135deg, #10b981, #059669)';
+                    setTimeout(() => {
+                        btn.innerHTML = originalText;
+                        btn.style.background = '';
+                    }, 2000);
+                } else {
+                    alert('کانفیگ کپی شد!');
+                }
+            };
+
+            const showError = () => {
+                if (btn) {
+                    const originalText = btn.innerHTML;
+                    btn.innerHTML = '<i class="fas fa-times"></i> خطا!';
+                    btn.style.background = 'linear-gradient(135deg, #ef4444, #dc2626)';
+                    setTimeout(() => {
+                        btn.innerHTML = originalText;
+                        btn.style.background = '';
+                    }, 2000);
+                } else {
+                    alert('خطا در کپی کانفیگ');
+                }
+            };
+
+            // Try modern clipboard API first
+            if (navigator.clipboard && navigator.clipboard.writeText) {
+                navigator.clipboard.writeText(configText)
+                    .then(showSuccess)
+                    .catch((err) => {
+                        console.error('Clipboard API failed:', err);
+                        // Fallback to execCommand
+                        fallbackCopyConfig(configText, showSuccess, showError);
+                    });
+            } else {
+                // Use fallback method
+                fallbackCopyConfig(configText, showSuccess, showError);
+            }
+        }
+
+        // Fallback copy method for older browsers
+        function fallbackCopyConfig(text, onSuccess, onError) {
+            const ta = document.createElement('textarea');
+            ta.value = text;
+            ta.setAttribute('readonly', '');
+            ta.style.position = 'absolute';
+            ta.style.left = '-9999px';
+            ta.style.top = '0';
+            document.body.appendChild(ta);
+            
+            try {
+                ta.select();
+                ta.setSelectionRange(0, 99999); // For mobile devices
+                const successful = document.execCommand('copy');
+                if (successful) {
+                    onSuccess();
+                } else {
+                    onError();
+                }
+            } catch (err) {
+                console.error('Fallback copy failed:', err);
+                onError();
+            } finally {
+                ta.remove();
+            }
+        }
+
+        // تابع کپی کردن Private Key
+        function copyToClipboard(button) {
+            if (!button || !button.parentElement) {
+                console.error('copyToClipboard: invalid button element');
+                return;
+            }
+            
+            const input = button.parentElement.querySelector('.private-key');
+            if (!input) {
+                console.error('copyToClipboard: private-key input not found');
+                return;
+            }
+            
+            const value = input.value || input.textContent || '';
+
+            if (!value || value.trim() === '') {
+                const original = button.innerHTML;
+                button.innerHTML = '<i class="fas fa-times"></i>';
+                button.style.background = '#ef4444';
+                setTimeout(() => {
+                    button.innerHTML = original;
+                    button.style.background = '';
+                }, 1000);
+                return;
+            }
+
+            if (navigator.clipboard && navigator.clipboard.writeText) {
+                navigator.clipboard.writeText(value).then(() => {
+                    const originalHTML = button.innerHTML;
+                    button.innerHTML = '<i class="fas fa-check"></i>';
+                    button.style.background = '#10b981';
+                    setTimeout(() => {
+                        button.innerHTML = originalHTML;
+                        button.style.background = '';
+                    }, 1500);
+                }).catch((err) => {
+                    console.error('Clipboard API failed:', err);
+                    fallbackCopy(value, button);
+                });
+            } else {
+                fallbackCopy(value, button);
+            }
+        }
+
+        function fallbackCopy(text, button) {
+            if (!text || !button) return;
+            
+            const ta = document.createElement('textarea');
+            ta.value = text;
+            ta.setAttribute('readonly', '');
+            ta.style.position = 'absolute';
+            ta.style.left = '-9999px';
+            document.body.appendChild(ta);
+            ta.select();
+            
+            try {
+                const success = document.execCommand('copy');
+                const originalHTML = button.innerHTML;
+                
+                if (success) {
+                    button.innerHTML = '<i class="fas fa-check"></i>';
+                    button.style.background = '#10b981';
+                } else {
+                    button.innerHTML = '<i class="fas fa-times"></i>';
+                    button.style.background = '#ef4444';
+                }
+                
+                setTimeout(() => {
+                    button.innerHTML = originalHTML;
+                    button.style.background = '';
+                }, 1500);
+            } catch (e) {
+                console.error('Fallback copy failed:', e);
+                const originalHTML = button.innerHTML;
+                button.innerHTML = '<i class="fas fa-times"></i>';
+                button.style.background = '#ef4444';
+                setTimeout(() => {
+                    button.innerHTML = originalHTML;
+                    button.style.background = '';
+                }, 1500);
+            } finally {
+                ta.remove();
+            }
+        }
+
+        // Show full private key in modal
+        function showKeyModal(key) {
+            const backdrop = document.getElementById('keyModalBackdrop');
+            const body = document.getElementById('keyModalBody');
+            
+            if (!backdrop || !body) {
+                console.error('showKeyModal: modal elements missing');
+                return;
+            }
+            
+            if (!key || (typeof key === 'string' && key.trim() === '')) {
+                body.textContent = '[خطا: کلید خالی است]';
+            } else {
+                body.textContent = key;
+            }
+            
+            backdrop.style.display = 'flex';
+        }
+
+        function closeKeyModal() {
+            const backdrop = document.getElementById('keyModalBackdrop');
+            if (backdrop) {
+                backdrop.style.display = 'none';
+            }
+        }
+
+        function copyModalKey() {
+            const body = document.getElementById('keyModalBody');
+            if (!body) {
+                alert('خطا: محتوا یافت نشد');
+                return;
+            }
+            
+            const key = body.textContent;
+            
+            if (!key || key.trim() === '' || key.includes('[خطا:')) {
+                alert('کلید خصوصی معتبر نیست');
+                return;
+            }
+            
+            if (!navigator.clipboard || !navigator.clipboard.writeText) {
+                // Fallback method
+                const ta = document.createElement('textarea');
+                ta.value = key;
+                ta.style.position = 'absolute';
+                ta.style.left = '-9999px';
+                document.body.appendChild(ta);
+                ta.select();
+                
+                try {
+                    document.execCommand('copy');
+                    alert('کلید خصوصی کپی شد!');
+                } catch (e) {
+                    alert('خطا در کپی کلید');
+                } finally {
+                    ta.remove();
+                }
+                return;
+            }
+            
+            navigator.clipboard.writeText(key).then(() => {
+                alert('کلید خصوصی کپی شد!');
+            }).catch((err) => {
+                console.error('Copy error:', err);
+                alert('خطا در کپی کلید');
+            });
+        }
+
+        // تابع به روزرسانی نمودار
+        let usageChart = null;
+        function updateChart() {
+            const el = document.getElementById('usageChart');
+            if (!el) return;
+            const ctx = el.getContext('2d');
+            const src = (window.USER_USAGE && Array.isArray(window.USER_USAGE.labels) && Array.isArray(window.USER_USAGE.data))
+                ? window.USER_USAGE
+                : { labels: ['-','-','-','-','-','-','-'], data: [0,0,0,0,0,0,0] };
+
+            if (usageChart) {
+                usageChart.destroy();
+            }
+
+            usageChart = new Chart(ctx, {
+                type: 'line',
+                data: {
+                    labels: src.labels,
+                    datasets: [{
+                        label: 'مصرف داده (GB)',
+                        data: src.data,
+                        borderColor: '#6366f1',
+                        backgroundColor: 'rgba(99, 102, 241, 0.1)',
+                        borderWidth: 2,
+                        fill: true,
+                        tension: 0.4,
+                        pointBackgroundColor: '#6366f1',
+                        pointBorderColor: '#ffffff',
+                        pointBorderWidth: 2,
+                        pointRadius: 5,
+                        pointHoverRadius: 7
+                    }]
+                },
+                options: {
+                    responsive: true,
+                    maintainAspectRatio: false,
+                    plugins: {
+                        legend: {
+                            display: true,
+                            position: 'top',
+                            labels: {
+                                color: '#ffffff',
+                                font: {
+                                    family: 'Vazir, Arial, sans-serif'
+                                }
+                            }
+                        }
+                    },
+                    scales: {
+                        x: {
+                            ticks: {
+                                color: '#cccccc',
+                                font: {
+                                    family: 'Vazir, Arial, sans-serif'
+                                },
+                                maxRotation: 45,
+                                minRotation: 45
+                            },
+                            grid: {
+                                color: 'rgba(255, 255, 255, 0.1)'
+                            }
+                        },
+                        y: {
+                            ticks: {
+                                color: '#cccccc',
+                                font: {
+                                    family: 'Vazir, Arial, sans-serif'
+                                }
+                            },
+                            grid: {
+                                color: 'rgba(255, 255, 255, 0.1)'
+                            }
+                        }
+                    }
+                }
+            });
+        }
+
+        // مقداردهی اولیه نمودار
+        document.addEventListener('DOMContentLoaded', function() {
+            // Initialize chart if it exists (user panel)
+            const chartEl = document.getElementById('usageChart');
+            if (chartEl) {
+                updateChart();
+            }
+            
+            // Handle login form specifically
+            const loginForm = document.getElementById('loginForm');
+            const loginBtn = document.getElementById('loginBtn');
+            const pkInput = document.getElementById('pkInput');
+            
+            if (loginForm && loginBtn && pkInput) {
+                // Auto-focus on input
+                pkInput.focus();
+                
+                // Remove leading/trailing whitespace only on blur (not during typing)
+                pkInput.addEventListener('blur', function() {
+                    this.value = this.value.trim();
+                });
+                
+                // Trim on paste after a small delay
+                pkInput.addEventListener('paste', function(e) {
+                    setTimeout(() => {
+                        this.value = this.value.trim();
+                    }, 10);
+                });
+                
+                // Handle form submit
+                loginForm.addEventListener('submit', function(e) {
+                    // Trim the value before validation
+                    const pkValue = pkInput.value.trim();
+                    
+                    // Update the input with trimmed value
+                    pkInput.value = pkValue;
+                    
+                    // Client-side validation
+                    if (!pkValue || pkValue === '') {
+                        e.preventDefault();
+                        alert('لطفا کلید خصوصی خود را وارد کنید');
+                        pkInput.focus();
+                        return false;
+                    }
+                    
+                    if (pkValue.length < 40) {
+                        e.preventDefault();
+                        alert('کلید خصوصی باید حداقل 40 کاراکتر داشته باشد\nکلید وارد شده: ' + pkValue.length + ' کاراکتر');
+                        pkInput.select();
+                        return false;
+                    }
+                    
+                    // Check if it looks like a valid base64 key
+                    const base64Pattern = /^[A-Za-z0-9+/]+=*$/;
+                    if (!base64Pattern.test(pkValue)) {
+                        e.preventDefault();
+                        alert('کلید خصوصی باید فقط شامل حروف، اعداد و کاراکترهای +/= باشد');
+                        pkInput.select();
+                        return false;
+                    }
+                    
+                    // Valid - show loading
+                    const originalHTML = loginBtn.innerHTML;
+                    loginBtn.innerHTML = '<i class="fas fa-spinner fa-spin"></i> در حال ورود...';
+                    loginBtn.disabled = true;
+                    // Do NOT disable the input; disabled fields are not submitted with the form
+                    // Make it read-only instead to prevent edits while submitting
+                    pkInput.readOnly = true;
+                    
+                    // Don't prevent default - let form submit naturally
+                    return true;
+                });
+            }
+            
+            // Add loading animation to other submit buttons (not login)
+            const buttons = document.querySelectorAll('button[type="submit"]:not(#loginBtn)');
+            buttons.forEach(button => {
+                button.addEventListener('click', function() {
+                    if (this.form && this.form.checkValidity()) {
+                        const originalHTML = this.innerHTML;
+                        this.innerHTML = '<i class="fas fa-spinner fa-spin"></i> در حال پردازش...';
+                        this.disabled = true;
+                        
+                        // Restore button after 5 seconds (fallback)
+                        setTimeout(() => {
+                            this.innerHTML = originalHTML;
+                            this.disabled = false;
+                        }, 5000);
+                    }
+                });
+            });
+        });
+
+        // توابع مدیریتی
         function searchUsers() {
             const input = document.getElementById('searchUsers');
-            const filter = input.value.toLowerCase();
             const table = document.getElementById('clientsTable');
+            
+            if (!input || !table) {
+                console.error('searchUsers: required elements missing');
+                return;
+            }
+            
+            const filter = input.value.toLowerCase();
             const tr = table.getElementsByTagName('tr');
 
             for (let i = 1; i < tr.length; i++) {
@@ -3700,747 +6696,665 @@ $server_stats = get_live_server_stats();
             }
         }
 
+        // اصلاح تابع نمایش فرم ویرایش
         function showEditForm(clientName, currentGB, currentDays) {
-            document.getElementById('editClientName').value = clientName;
-            document.getElementById('editClientGB').value = currentGB;
-            document.getElementById('editClientDays').value = currentDays;
-            document.getElementById('editForm').style.display = 'block';
+            const nameField = document.getElementById('editClientName');
+            const gbField = document.getElementById('editClientGB');
+            const daysField = document.getElementById('editClientDays');
+            const form = document.getElementById('editForm');
+            const msgElem = document.getElementById('editClientMsg');
+            
+            if (!nameField || !gbField || !daysField || !form) {
+                showMessage('خطا در بارگذاری فرم ویرایش', 'error');
+                return;
+            }
+            
+            // پاک کردن پیام قبلی
+            if (msgElem) {
+                msgElem.textContent = '';
+                msgElem.className = '';
+            }
+            
+            nameField.value = clientName;
+            gbField.value = currentGB;
+            daysField.value = currentDays;
+            form.style.display = 'block';
+            
+            form.scrollIntoView({ behavior: 'smooth', block: 'nearest' });
+        }
+
+        // تابع جدید برای ارسال ویرایش با AJAX
+        function submitEditClient() {
+            const nameField = document.getElementById('editClientName');
+            const gbField = document.getElementById('editClientGB');
+            const daysField = document.getElementById('editClientDays');
+            const pkField = document.getElementById('editClientPk');
+            const msgElem = document.getElementById('editClientMsg');
+            
+            if (!nameField || !gbField || !daysField || !pkField) {
+                showMessage('خطا: فیلدهای فرم یافت نشد', 'error');
+                return;
+            }
+            
+            const clientName = nameField.value.trim();
+            const newGB = parseFloat(gbField.value);
+            const newDays = parseInt(daysField.value);
+            const pk = pkField.value;
+            
+            // اعتبارسنجی
+            if (!clientName || isNaN(newGB) || isNaN(newDays)) {
+                if (msgElem) {
+                    msgElem.textContent = 'لطفاً تمام فیلدها را به درستی پر کنید';
+                    msgElem.className = 'error-message';
+                }
+                return;
+            }
+            
+            if (newGB < 0.1 || newGB > 1000) {
+                if (msgElem) {
+                    msgElem.textContent = 'سهمیه باید بین 0.1 تا 1000 گیگابایت باشد';
+                    msgElem.className = 'error-message';
+                }
+                return;
+            }
+            
+            if (newDays < 1 || newDays > 3650) {
+                if (msgElem) {
+                    msgElem.textContent = 'مدت اعتبار باید بین 1 تا 3650 روز باشد';
+                    msgElem.className = 'error-message';
+                }
+                return;
+            }
+            
+            // نمایش وضعیت در حال پردازش
+            if (msgElem) {
+                msgElem.textContent = 'در حال ویرایش...';
+                msgElem.className = 'success-message';
+            }
+            
+            // ارسال درخواست
+            const formData = new FormData();
+            formData.append('pk', pk);
+            formData.append('admin_action', 'edit-client');
+            formData.append('param1', clientName);
+            formData.append('param2', newGB);
+            formData.append('param3', newDays);
+            
+            fetch(window.location.href, {
+                method: 'POST',
+                headers: {
+                    'X-Requested-With': 'XMLHttpRequest'
+                },
+                body: formData
+            })
+            .then(response => {
+                const contentType = response.headers.get('content-type');
+                if (contentType && contentType.includes('application/json')) {
+                    return response.json();
+                }
+                return response.text().then(text => {
+                    console.log('Response is not JSON:', text.substring(0, 200));
+                    // تلاش برای تشخیص موفقیت از HTML
+                    return {
+                        status: (text.includes('خطا:') || text.includes('Error:')) ? 'error' : 'success',
+                        message: text.includes('خطا:') ? 'خطا در ویرایش کاربر' : 'عملیات انجام شد'
+                    };
+                });
+            })
+            .then(data => {
+                if (data.status === 'success') {
+                    if (msgElem) {
+                        msgElem.textContent = data.message || 'کاربر با موفقیت ویرایش شد';
+                        msgElem.className = 'success-message';
+                    }
+                    showMessage(`کاربر "${clientName}" با موفقیت ویرایش شد. برای مشاهده تغییرات، دکمه "بروزرسانی لیست" را بزنید.`, 'success');
+                    
+                    // فقط فرم را مخفی می‌کنیم، بدون reload خودکار
+                    setTimeout(() => {
+                        hideEditForm();
+                    }, 1500);
+                } else {
+                    const errorMsg = data.message || 'خطا در ویرایش کاربر';
+                    if (msgElem) {
+                        msgElem.textContent = errorMsg;
+                        msgElem.className = 'error-message';
+                    }
+                    showMessage(errorMsg, 'error');
+                    
+                    // نمایش اطلاعات debug در console
+                    if (data.debug) {
+                        console.error('Edit client debug info:', data.debug);
+                    }
+                }
+            })
+            .catch(error => {
+                console.error('Edit client error:', error);
+                if (msgElem) {
+                    msgElem.textContent = 'خطا در ارتباط با سرور';
+                    msgElem.className = 'error-message';
+                }
+                showMessage('خطا در ارتباط با سرور', 'error');
+            });
+        }
+
+        // اصلاح تابع حذف کاربر
+        function deleteUser(clientName) {
+            const confirmation = confirm(`آیا از حذف کاربر "${clientName}" مطمئن هستید؟\nاین عمل غیرقابل بازگشت است!`);
+            
+            if (confirmation) {
+                sendAdminAction('remove-client', clientName);
+            }
         }
 
         function hideEditForm() {
-            document.getElementById('editForm').style.display = 'none';
+            const form = document.getElementById('editForm');
+            if (form) {
+                form.style.display = 'none';
+            }
+            
+            // پاک کردن پیام
+            const msgElem = document.getElementById('editClientMsg');
+            if (msgElem) {
+                msgElem.textContent = '';
+                msgElem.className = '';
+            }
         }
 
-        function confirmDelete(clientName) {
-            return confirm('آیا از حذف کاربر "' + clientName + '" مطمئن هستید؟');
+        // اضافه کردن keyboard shortcut برای بستن فرم
+        document.addEventListener('keydown', function(event) {
+            if (event.key === 'Escape') {
+                const form = document.getElementById('editForm');
+                if (form && form.style.display !== 'none') {
+                    hideEditForm();
+                }
+            }
+        });
+
+        // تابع برای نمایش پیام به کاربر
+        function showMessage(message, type = 'info') {
+            // حذف پیام قبلی اگر وجود دارد
+            const existingMsg = document.getElementById('dynamic-message');
+            if (existingMsg) {
+                existingMsg.remove();
+            }
+            
+            // ایجاد پیام جدید
+            const messageDiv = document.createElement('div');
+            messageDiv.id = 'dynamic-message';
+            messageDiv.className = `message ${type}`;
+            messageDiv.style.cssText = `
+                position: fixed;
+                top: 20px;
+                left: 50%;
+                transform: translateX(-50%);
+                z-index: 10000;
+                min-width: 300px;
+                text-align: center;
+                animation: fadeIn 0.3s ease;
+            `;
+            
+            const icon = type === 'success' ? 'fa-check' : 
+                         type === 'error' ? 'fa-times' : 
+                         type === 'warning' ? 'fa-exclamation-triangle' : 'fa-info';
+            
+            messageDiv.innerHTML = `
+                <i class="fas ${icon}"></i>
+                ${message}
+            `;
+            
+            document.body.appendChild(messageDiv);
+            
+            // حذف خودکار پیام بعد از 5 ثانیه
+            setTimeout(() => {
+                if (messageDiv.parentNode) {
+                    messageDiv.style.animation = 'fadeOut 0.3s ease';
+                    setTimeout(() => messageDiv.remove(), 300);
+                }
+            }, 5000);
         }
 
-        // تابع کپی کردن Private Key
-        function copyToClipboard(button) {
-            const input = button.parentElement.querySelector('.private-key');
-            const value = input ? input.value || input.textContent : '';
+        // افزودن استایل fadeOut به CSS
+        (function() {
+            const style = document.createElement('style');
+            style.textContent = `
+                @keyframes fadeOut {
+                    from { opacity: 1; transform: translateX(-50%) translateY(0); }
+                    to { opacity: 0; transform: translateX(-50%) translateY(-20px); }
+                }
+            `;
+            document.head.appendChild(style);
+        })();
 
-            if (!value) {
-                // flash error briefly
-                const original = button.innerText;
-                button.innerText = '❌';
-                setTimeout(() => button.innerText = original, 900);
+        // تابع رفرش خودکار لیست - نسخه بهبود یافته
+        function refreshUserList() {
+            console.log('Refreshing user list...');
+            
+            let pkValue = (window.ADMIN_PK && window.ADMIN_PK.length) ? window.ADMIN_PK : '';
+            if (!pkValue) {
+                const allPk = Array.from(document.querySelectorAll('input[name="pk"]'));
+                const filled = allPk.find(i => i && i.value && i.value.trim().length > 0);
+                pkValue = filled ? filled.value.trim() : '';
+            }
+            if (!pkValue) {
+                console.warn('refreshUserList: no PK found');
+                showMessage('خطا: کلید احراز هویت یافت نشد', 'error');
                 return;
             }
 
-            // Use modern Clipboard API when available
-            if (navigator.clipboard && navigator.clipboard.writeText) {
-                navigator.clipboard.writeText(value).then(() => {
-                    const originalEmoji = button.innerText;
-                    button.innerText = '✅';
-                    button.style.color = '#4caf50';
-                    setTimeout(() => {
-                        button.innerText = originalEmoji;
-                        button.style.color = '';
-                    }, 1000);
-                }).catch(() => {
-                    // fallback
-                    fallbackCopy(value, button);
-                });
-            } else {
-                fallbackCopy(value, button);
+            const refreshBtn = document.querySelector('button[onclick="refreshUserList()"]');
+            const originalText = refreshBtn ? refreshBtn.innerHTML : '';
+            if (refreshBtn) {
+                refreshBtn.innerHTML = '<i class="fas fa-spinner fa-spin"></i> در حال بروزرسانی...';
+                refreshBtn.disabled = true;
             }
+
+            // ارسال درخواست با pk برای بارگذاری مجدد صفحه
+            const form = document.createElement('form');
+            form.method = 'POST';
+            form.action = window.location.href;
+            
+            const pkInput = document.createElement('input');
+            pkInput.type = 'hidden';
+            pkInput.name = 'pk';
+            pkInput.value = pkValue;
+            form.appendChild(pkInput);
+            
+            // افزودن یک timestamp برای force refresh
+            const timestampInput = document.createElement('input');
+            timestampInput.type = 'hidden';
+            timestampInput.name = '_refresh_timestamp';
+            timestampInput.value = Date.now().toString();
+            form.appendChild(timestampInput);
+            
+            document.body.appendChild(form);
+            
+            // نمایش پیام
+            showMessage('در حال بروزرسانی لیست کاربران...', 'info');
+            
+            // ارسال فرم
+            setTimeout(() => {
+                form.submit();
+            }, 500);
         }
 
-        function fallbackCopy(text, button) {
-            // create temporary textarea
-            const ta = document.createElement('textarea');
-            ta.value = text;
-            ta.setAttribute('readonly', '');
-            ta.style.position = 'absolute';
-            ta.style.left = '-9999px';
-            document.body.appendChild(ta);
-            ta.select();
-            try {
-                document.execCommand('copy');
-                const originalEmoji = button.innerText;
-                button.innerText = '✅';
-                button.style.color = '#4caf50';
+        // تابع اصلاح شده برای ارسال عملیات مدیریتی
+        function sendAdminAction(action, param1 = '', param2 = '', param3 = '') {
+            console.log('sendAdminAction called:', { action, param1, param2, param3 });
+            
+            let pkValue = (window.ADMIN_PK && window.ADMIN_PK.length) ? window.ADMIN_PK : '';
+            if (!pkValue) {
+                const allPk = Array.from(document.querySelectorAll('input[name="pk"]'));
+                const filled = allPk.find(i => i && i.value && i.value.trim().length > 0);
+                pkValue = filled ? filled.value.trim() : '';
+            }
+            
+            console.log('PK value found:', pkValue ? 'YES' : 'NO');
+            
+            if (!pkValue) {
+                console.error('sendAdminAction: no PK found');
+                showMessage('کلید خصوصی مدیر موجود نیست', 'error');
+                return;
+            }
+
+            // نمایش وضعیت loading
+            showLoadingState(action, true);
+
+            const body = new URLSearchParams();
+            body.append('pk', pkValue);
+            body.append('admin_action', action);
+            if (param1 !== '') body.append('param1', param1);
+            if (param2 !== '') body.append('param2', param2);
+            if (param3 !== '') body.append('param3', param3);
+
+            console.log('Request body:', body.toString());
+
+            const controller = new AbortController();
+            const timeoutId = setTimeout(() => controller.abort(), 30000);
+
+            console.log('Sending fetch request to:', window.location.href);
+
+            fetch(window.location.href, {
+                method: 'POST',
+                headers: {
+                    'Content-Type': 'application/x-www-form-urlencoded',
+                    'X-Requested-With': 'XMLHttpRequest'  // برای تشخیص AJAX در PHP
+                },
+                body: body.toString(),
+                signal: controller.signal
+            })
+            .then(response => {
+                console.log('Response received:', response.status, response.statusText);
+                clearTimeout(timeoutId);
+                if (!response.ok) {
+                    throw new Error(`خطای شبکه: ${response.status} ${response.statusText}`);
+                }
+                
+                // بررسی content-type برای تعیین نوع پاسخ
+                const contentType = response.headers.get('content-type');
+                console.log('Response content-type:', contentType);
+                if (contentType && contentType.includes('application/json')) {
+                    return response.json();
+                }
+                return response.text();
+            })
+            .then(data => {
+                console.log('Admin action response received for:', action);
+                console.log('Response type:', typeof data);
+                console.log('Response data:', data);
+                
+                // اگر پاسخ JSON بود
+                if (typeof data === 'object' && data !== null) {
+                    console.log('Processing JSON response, status:', data.status);
+                    
+                    if (data.status === 'error') {
+                        throw new Error(data.message || 'عملیات با خطا مواجه شد');
+                    }
+                    
+                    // موفقیت با JSON - اضافه کردن یادآوری برای refresh دستی
+                    let successMsg = data.message || `عملیات "${getActionName(action)}" با موفقیت انجام شد`;
+                    
+                    // برای update-status پیام کمتری نمایش بده
+                    if (action === 'update-status') {
+                        successMsg = 'وضعیت سرویس به‌روز شد';
+                    } else if (action === 'remove-client' || action === 'edit-client') {
+                        successMsg += '. برای مشاهده تغییرات، دکمه "بروزرسانی لیست کاربران" را بزنید';
+                    }
+                    
+                    showMessage(successMsg, 'success');
+                    handleActionSuccess(action, data);
+                    return;
+                }
+                
+                // اگر پاسخ HTML/text بود، بررسی خطا
+                const html = String(data);
+                console.log('Processing HTML response, length:', html.length);
+                
+                const hasRealError = (
+                    html.includes('PHP Fatal error') || 
+                    html.includes('PHP Warning') ||
+                    html.includes('PHP Error') ||
+                    /(?:^|>)\s*خطا:/m.test(html) ||
+                    /(?:^|>)\s*Error:/m.test(html) ||
+                    html.includes('Command failed') ||
+                    (html.includes('not found') && !html.includes('console'))
+                );
+                
+                if (hasRealError) {
+                    console.error('Error detected in HTML response');
+                    const errorMatch = html.match(/(?:خطا:|Error:)\s*([^\n<]+)/i);
+                    const errorMsg = errorMatch ? errorMatch[1].trim() : 'عملیات با خطا مواجه شد';
+                    throw new Error(errorMsg);
+                }
+                
+                console.log('No error detected, operation successful');
+                // موفقیت با HTML
+                let htmlSuccessMsg = `عملیات "${getActionName(action)}" با موفقیت انجام شد`;
+                if (action === 'remove-client' || action === 'edit-client') {
+                    htmlSuccessMsg += '. برای مشاهده تغییرات، دکمه "بروزرسانی لیست کاربران" را بزنید';
+                }
+                showMessage(htmlSuccessMsg, 'success');
+                handleActionSuccess(action);
+            })
+            .catch((error) => {
+                clearTimeout(timeoutId);
+                console.error('sendAdminAction error:', error);
+                
+                let errorMsg = 'خطا در اجرای عملیات';
+                if (error.name === 'AbortError') {
+                    errorMsg = 'زمان درخواست تمام شد';
+                } else if (error.message) {
+                    errorMsg = error.message;
+                }
+                
+                showMessage(errorMsg, 'error');
+            })
+            .finally(() => {
+                showLoadingState(action, false);
+            });
+        }
+
+        // تابع کمکی برای نمایش نام عملیات
+        function getActionName(action) {
+            const actions = {
+                'start-service': 'راه‌اندازی سرویس',
+                'stop-service': 'توقف سرویس', 
+                'restart-service': 'راه‌اندازی مجدد سرویس',
+                'update-status': 'بروزرسانی وضعیت',
+                'set-endpoint': 'به‌روزرسانی Endpoint و DNS',
+                'remove-client': 'حذف کاربر',
+                'edit-client': 'ویرایش کاربر',
+                'add-client': 'افزودن کاربر'
+            };
+            return actions[action] || action;
+        }
+
+        // تابع برای مدیریت موفقیت عملیات
+        function handleActionSuccess(action, data = null) {
+            console.log('handleActionSuccess called with action:', action, 'data:', data);
+            
+            // به‌روزرسانی وضعیت سرویس اگر در پاسخ موجود بود
+            if (data && data.service_status) {
+                console.log('Updating service status from response:', data.service_status);
+                updateServiceStatusDisplay(data.service_status);
+            }
+            
+            // برای عملیات سرویس، وضعیت را بعد از یک تأخیر کوتاه دوباره به‌روز کن
+            if (action === 'start-service' || action === 'stop-service' || action === 'restart-service') {
+                console.log('Service action detected, will update status after 1.5 seconds');
                 setTimeout(() => {
-                    button.innerText = originalEmoji;
-                    button.style.color = '';
-                }, 1000);
-            } catch (e) {
-                const originalEmoji = button.innerText;
-                button.innerText = '❌';
-                setTimeout(() => button.innerText = originalEmoji, 900);
+                    console.log('Fetching updated service status...');
+                    updateServiceStatus();
+                }, 1500);
             }
-            ta.remove();
-        }
-
-        // Show full private key in modal
-        function showKeyModal(key) {
-            const backdrop = document.getElementById('keyModalBackdrop');
-            const body = document.getElementById('keyModalBody');
-            if (backdrop && body) {
-                body.textContent = key;
-                backdrop.style.display = 'flex';
+            
+            // برای به‌روزرسانی endpoint/DNS، صفحه را reload کن تا اطلاعات جدید بارگذاری شود
+            if (action === 'set-endpoint') {
+                setTimeout(() => {
+                    showMessage('تنظیمات با موفقیت به‌روز شد. در حال بارگذاری مجدد...', 'success');
+                    setTimeout(() => {
+                        location.reload();
+                    }, 1500);
+                }, 500);
             }
+            
+            console.log('Operation completed successfully. Use manual refresh button to update list if needed.');
         }
 
-        function closeKeyModal() {
-            const backdrop = document.getElementById('keyModalBackdrop');
-            if (backdrop) backdrop.style.display = 'none';
-        }
-        const sampleData = {
-    7: {
-        labels: ['۶ روز قبل', '۵ روز قبل', '۴ روز قبل', '۳ روز قبل', '۲ روز قبل', 'دیروز', 'امروز'],
-        data: [0.5, 0.8, 1.2, 0.9, 1.5, 2.1, 0.7]
-    },
-    30: {
-        labels: Array.from({length: 30}, (_, i) => `${29-i} روز قبل`).reverse(),
-        data: Array.from({length: 30}, () => Math.random() * 3)
-    },
-    90: {
-        labels: Array.from({length: 12}, (_, i) => `ماه ${i+1}`),
-        data: Array.from({length: 12}, () => Math.random() * 20 + 5)
-    }
-};
-
-let usageChart = null;
-
-// تابع تغییر بازه زمانی نمودار
-function changeTimeframe(days) {
-    // به روزرسانی وضعیت دکمه‌ها
-    document.querySelectorAll('.chart-timeframe').forEach(btn => {
-        btn.classList.remove('active');
-    });
-    event.target.classList.add('active');
-    
-    // به روزرسانی نمودار
-    updateChart(days);
-}
-
-// تابع به روزرسانی نمودار با داده‌های هفتگی سرور
-function updateChart() {
-    const el = document.getElementById('usageChart');
-    if (!el) return;
-    const ctx = el.getContext('2d');
-    const src = (window.USER_USAGE && Array.isArray(window.USER_USAGE.labels) && Array.isArray(window.USER_USAGE.data))
-        ? window.USER_USAGE
-        : { labels: ['-','-','-','-','-','-','-'], data: [0,0,0,0,0,0,0] };
-
-    if (usageChart) {
-        usageChart.destroy();
-    }
-
-    usageChart = new Chart(ctx, {
-        type: 'line',
-        data: {
-            labels: src.labels,
-            datasets: [{
-                label: 'مصرف داده (GB)',
-                data: src.data,
-                borderColor: '#4fc3f7',
-                backgroundColor: 'rgba(79, 195, 247, 0.1)',
-                borderWidth: 2,
-                fill: true,
-                tension: 0.4,
-                pointBackgroundColor: '#4fc3f7',
-                pointBorderColor: '#ffffff',
-                pointBorderWidth: 2,
-                pointRadius: 5,
-                pointHoverRadius: 7
-            }]
-        },
-        options: {
-            responsive: true,
-            maintainAspectRatio: false,
-            plugins: {
-                legend: {
-                    display: true,
-                    position: 'top',
-                    labels: {
-                        color: '#ffffff',
-                        font: {
-                            family: 'Vazir, Arial, sans-serif'
-                        }
-                    }
-                },
-                tooltip: {
-                    backgroundColor: 'rgba(0, 0, 0, 0.8)',
-                    titleColor: '#4fc3f7',
-                    bodyColor: '#ffffff',
-                    rtl: true,
-                    titleFont: {
-                        family: 'Vazir, Arial, sans-serif'
-                    },
-                    bodyFont: {
-                        family: 'Vazir, Arial, sans-serif'
-                    }
+        // تابع برای به‌روزرسانی نمایش وضعیت سرویس
+        function updateServiceStatusDisplay(status) {
+            console.log('Updating service status display to:', status);
+            
+            // به‌روزرسانی در بخش تنظیمات
+            const statusBadge = document.getElementById('service-status-badge');
+            const statusText = document.getElementById('service-status-text');
+            
+            if (statusBadge && statusText) {
+                if (status === 'active') {
+                    statusBadge.className = 'status-badge status-active';
+                    statusText.textContent = 'فعال';
+                } else {
+                    statusBadge.className = 'status-badge status-inactive';
+                    statusText.textContent = 'غیرفعال';
                 }
-            },
-            scales: {
-                x: {
-                    ticks: {
-                        color: '#cccccc',
-                        font: {
-                            family: 'Vazir, Arial, sans-serif'
-                        },
-                        maxRotation: 45,
-                        minRotation: 45
-                    },
-                    grid: {
-                        color: 'rgba(255, 255, 255, 0.1)'
-                    }
-                },
-                y: {
-                    ticks: {
-                        color: '#cccccc',
-                        font: {
-                            family: 'Vazir, Arial, sans-serif'
-                        }
-                    },
-                    grid: {
-                        color: 'rgba(255, 255, 255, 0.1)'
-                    },
-                    title: {
-                        display: true,
-                        text: 'گیگابایت (GB)',
-                        color: '#cccccc',
-                        font: {
-                            family: 'Vazir, Arial, sans-serif'
-                        }
+            }
+            
+            // به‌روزرسانی در پیشخوان
+            const dashboardStatus = document.getElementById('dashboard-service-status');
+            if (dashboardStatus) {
+                dashboardStatus.textContent = (status === 'active') ? 'فعال' : 'غیرفعال';
+            }
+            
+            // به‌روزرسانی آیکون stat-card در پیشخوان
+            const dashboardStatCard = dashboardStatus?.closest('.stat-card');
+            if (dashboardStatCard) {
+                const statIcon = dashboardStatCard.querySelector('.stat-icon');
+                if (statIcon) {
+                    if (status === 'active') {
+                        statIcon.className = 'stat-icon success';
+                    } else {
+                        statIcon.className = 'stat-icon danger';
                     }
                 }
             }
         }
-    });
-}
 
-// مقداردهی اولیه نمودار هنگام لود صفحه
-document.addEventListener('DOMContentLoaded', function() {
-    updateChart();
-});
+        // تابع برای بروزرسانی وضعیت سرویس
+        function updateServiceStatus(showNotification = false) {
+            console.log('=== updateServiceStatus called ===');
+            console.log('Show notification:', showNotification);
+            
+            if (showNotification) {
+                showMessage('در حال بروزرسانی وضعیت...', 'info');
+            }
+            
+            sendAdminAction('update-status');
+        }
 
-// اگر کاربر مدیر است، تابع رفرش نمودار را نیز اضافه می‌کنیم
-function refreshChart() {
-    if (usageChart) {
-        updateChart(); // رفرش هفتگی بر اساس داده‌های سرور
-    }
-}
+        // تابع برای بروزرسانی وضعیت سرویس در پیشخوان
+        function updateDashboardServiceStatus() {
+            console.log('=== updateDashboardServiceStatus called ===');
+            showMessage('در حال بروزرسانی وضعیت سرویس...', 'info');
+            sendAdminAction('update-status');
+        }
+
+        // تابع جدید برای force refresh کامل صفحه
+        function forceRefreshStatus() {
+            console.log('=== Force refresh status called ===');
+            showMessage('در حال بارگذاری مجدد کامل وضعیت...', 'warning');
+            
+            // Add timestamp to force fresh request
+            const url = new URL(window.location);
+            url.searchParams.set('_refresh', Date.now());
+            
+            setTimeout(() => {
+                window.location.href = url.toString();
+            }, 500);
+        }
+
+        // تابع برای نمایش وضعیت loading
+        function showLoadingState(action, isLoading) {
+            const actionNames = {
+                'start-service': 'راه‌اندازی سرویس',
+                'stop-service': 'توقف سرویس',
+                'restart-service': 'راه‌اندازی مجدد'
+            };
+            
+            if (isLoading) {
+                showMessage(`در حال ${actionNames[action] || 'اجرای عملیات'}...`, 'warning');
+            }
+        }
+
+        // تابع ویژه برای عملیات سرویس (با تاییدیه)
+        function handleServiceAction(action) {
+            console.log('=== handleServiceAction called ===');
+            console.log('Action:', action);
+            
+            const actionNames = {
+                'start-service': 'راه‌اندازی',
+                'stop-service': 'توقف', 
+                'restart-service': 'راه‌اندازی مجدد'
+            };
+            
+            const actionName = actionNames[action];
+            
+            if (!actionName) {
+                console.error('Unknown action:', action);
+                showMessage('عملیات نامعتبر', 'error');
+                return;
+            }
+            
+            console.log('Showing confirmation dialog for:', actionName);
+            const confirmation = confirm(`آیا از ${actionName} سرویس WireGuard مطمئن هستید؟`);
+            
+            if (confirmation) {
+                console.log('User confirmed, sending action');
+                sendAdminAction(action);
+            } else {
+                console.log('User cancelled');
+            }
+        }
+
+        // Event listener برای فرم تنظیمات Endpoint
+        document.addEventListener('DOMContentLoaded', function() {
+            console.log('=== DOMContentLoaded fired ===');
+            
+            // بررسی وجود PK
+            const pkInputs = document.querySelectorAll('input[name="pk"]');
+            console.log('Found PK inputs:', pkInputs.length);
+            if (pkInputs.length > 0) {
+                const pkValue = pkInputs[0].value;
+                console.log('PK value available:', pkValue ? 'YES (length: ' + pkValue.length + ')' : 'NO');
+                // ذخیره در window برای دسترسی آسان
+                window.ADMIN_PK = pkValue;
+            } else {
+                console.error('NO PK INPUT FOUND!');
+            }
+            
+            const endpointForm = document.getElementById('endpoint-form');
+            console.log('Endpoint form found:', !!endpointForm);
+            
+            if (endpointForm) {
+                console.log('Adding submit listener to endpoint form');
+                
+                // حذف event listener قبلی اگر وجود داشت
+                const newForm = endpointForm.cloneNode(true);
+                endpointForm.parentNode.replaceChild(newForm, endpointForm);
+                
+                newForm.addEventListener('submit', function(e) {
+                    console.log('=== Form submit event triggered ===');
+                    e.preventDefault();
+                    e.stopPropagation();
+                    
+                    const domain = document.getElementById('endpoint-domain').value.trim();
+                    const port = document.getElementById('endpoint-port').value.trim();
+                    const dns = document.getElementById('endpoint-dns').value.trim();
+                    
+                    console.log('Form values:', { 
+                        domain: domain, 
+                        port: port, 
+                        dns: dns 
+                    });
+                    
+                    if (!domain || !port || !dns) {
+                        console.error('Validation failed: empty fields');
+                        showMessage('لطفاً تمام فیلدها را پر کنید', 'error');
+                        return false;
+                    }
+                    
+                    if (port < 1 || port > 65535) {
+                        console.error('Validation failed: invalid port');
+                        showMessage('پورت باید بین 1 تا 65535 باشد', 'error');
+                        return false;
+                    }
+                    
+                    console.log('Validation passed, calling sendAdminAction');
+                    showMessage('در حال به‌روزرسانی تنظیمات...', 'warning');
+                    
+                    // تأخیر کوچک برای نمایش پیام
+                    setTimeout(() => {
+                        sendAdminAction('set-endpoint', domain, port, dns);
+                    }, 100);
+                    
+                    return false;
+                });
+                
+                console.log('✓ Submit listener attached successfully');
+            } else {
+                console.error('✗ Endpoint form NOT FOUND!');
+            }
+            
+            // اطلاعات اضافی برای دیباگ
+            console.log('Page URL:', window.location.href);
+            console.log('Page ready for admin actions');
+        });
+
+
     </script>
-</head>
-
-<body>
-    <div class="container">
-        <div class="header">
-            <h1>🔒 پنل مدیریت WireGuard</h1>
-            <p>مدیریت پیشرفته کاربران، سهمیه‌بندی، QR Code و تنظیمات حرفه‌ای</p>
-        </div>
-
-        <!-- Modal for displaying full private key -->
-        <div id="keyModalBackdrop" class="modal-backdrop" onclick="closeKeyModal()" aria-hidden="true">
-            <div class="modal" role="dialog" aria-modal="true" onclick="event.stopPropagation()">
-                <div class="modal-header">
-                    <strong>کلید خصوصی (Private Key)</strong>
-                    <button onclick="closeKeyModal()" style="background:transparent;border:none;color:#fff;font-size:18px;cursor:pointer">✖</button>
-                </div>
-                <div id="keyModalBody" class="modal-body">-----</div>
-                <div class="modal-actions">
-                    <button class="copy-btn" onclick="(function(){ const k=document.getElementById('keyModalBody').textContent; if(navigator.clipboard) navigator.clipboard.writeText(k); else { const ta=document.createElement('textarea'); ta.value=k; document.body.appendChild(ta); ta.select(); document.execCommand('copy'); ta.remove(); } })()">📋 کپی</button>
-                    <button class="btn" onclick="closeKeyModal()">بستن</button>
-                </div>
-            </div>
-        </div>
-
-        <div class="card">
-            <h2>🔍 بررسی وضعیت اتصال</h2>
-            <form method="post">
-                <input type="text" name="pk" value="<?php echo isset($_POST['pk']) ? h($_POST['pk']) : ''; ?>" placeholder="کلید خصوصی خود را اینجا وارد کنید..." required>
-                <button type="submit">📊 بررسی وضعیت</button>
-            </form>
-            <div class="help">
-                PrivateKey را از فایل کانفیگ خود کپی کرده و در فیلد بالا قرار دهید.
-            </div>
-        </div>
-
-        <?php if ($ok && $data): ?>
-            <?php if ($is_admin): ?>
-                <!-- پنل مدیریت -->
-                <div class="card admin-panel">
-                    <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:20px">
-                        <div>
-                            <h2 style="margin:0;color:#4fc3f7">👨‍💼 پنل مدیریت</h2>
-                            <div class="small">دسترسی کامل به مدیریت کاربران و تنظیمات سیستم</div>
-                        </div>
-                        <div style="background:rgba(76,175,80,0.2);padding:8px 15px;border-radius:20px;border:1px solid #4caf50">
-                            🟢 دسترسی مدیر
-                        </div>
-                    </div>
-
-                    <?php if (!empty($admin_message)): ?>
-                        <div class="message <?php echo contains_error($admin_message) ? 'error' : 'success'; ?>" style="margin-top:12px;white-space:pre-wrap"><?php echo h($admin_message); ?></div>
-                    <?php endif; ?>
-
-                    <!-- اطلاعات سرور -->
-                    <div class="admin-section">
-                        <h3>📊 اطلاعات سرور</h3>
-                        <div class="grid">
-                            <div class="stat">
-                                <div class="label">آدرس سرور</div>
-                                <div class="value"><?php echo h($server_info['endpoint'] ?? 'N/A'); ?></div>
-                            </div>
-                            <div class="stat">
-                                <div class="label">DNS سرورها</div>
-                                <div class="value"><?php echo h($server_info['dns'] ?? 'N/A'); ?></div>
-                            </div>
-                            <div class="stat">
-                                <div class="label">تعداد کاربران</div>
-                                <div class="value"><?php echo count($clients_list); ?></div>
-                            </div>
-                            <div class="stat">
-                                <div class="label">وضعیت سرویس</div>
-                                <div class="value <?php echo ($server_info['status'] === 'active') ? 'success' : 'error'; ?>">
-                                    <?php echo ($server_info['status'] === 'active') ? '🟢 فعال' : '🔴 غیرفعال'; ?>
-                                </div>
-                            </div>
-                        </div>
-
-                        <!-- بخش اطلاعات سرور -->
-                        <div class="card">
-                            <h2>📊 اطلاعات لحظه‌ای سرور</h2>
-                            <div class="server-stats-grid">
-                                <div class="stat-card">
-                                    <div class="icon">⚡</div>
-                                    <div class="label">مصرف CPU</div>
-                                    <div class="value"><?php echo $server_stats['cpu_usage']; ?>%</div>
-                                    <div class="progress-bar">
-                                        <div class="progress cpu" style="width: <?php echo $server_stats['cpu_usage']; ?>%"></div>
-                                    </div>
-                                </div>
-                                <div class="stat-card">
-                                    <div class="icon">🧠</div>
-                                    <div class="label">مصرف حافظه</div>
-                                    <div class="value"><?php echo $server_stats['memory_usage']; ?>%</div>
-                                    <div class="progress-bar">
-                                        <div class="progress memory" style="width: <?php echo $server_stats['memory_usage']; ?>%"></div>
-                                    </div>
-                                    <div class="small"><?php echo $server_stats['memory_used']; ?>MB / <?php echo $server_stats['memory_total']; ?>MB</div>
-                                </div>
-                                <div class="stat-card">
-                                    <div class="icon">💾</div>
-                                    <div class="label">مصرف دیسک</div>
-                                    <div class="value"><?php echo $server_stats['disk_usage']; ?>%</div>
-                                    <div class="progress-bar">
-                                        <div class="progress disk" style="width: <?php echo $server_stats['disk_usage']; ?>%"></div>
-                                    </div>
-                                </div>
-                                <div class="stat-card">
-                                    <div class="icon">🌐</div>
-                                    <div class="label">ترافیک شبکه</div>
-                                    <div class="value"><?php echo $server_stats['network_rx']; ?>MB ↓ / <?php echo $server_stats['network_tx']; ?>MB ↑</div>
-                                    <div class="progress-bar">
-                                        <div class="progress network" style="width: 50%"></div>
-                                    </div>
-                                    <div class="small">آپلود / دانلود</div>
-                                </div>
-                            </div>
-                            <div class="small" style="text-align: center; margin-top: 10px;">
-                                آپ‌تایم سرور: <?php echo $server_stats['uptime']; ?>
-                            </div>
-                        </div>
-                    </div>
-                    <!-- مدیریت کاربران -->
-                    <div class="admin-section">
-                        <h3>👥 مدیریت کاربران</h3>
-                        <div style="display:grid;grid-template-columns:1fr 1fr;gap:20px;margin-bottom:20px">
-                            <!-- افزودن کاربر جدید -->
-                            <div class="card" style="padding:15px">
-                                <h4 style="margin:0 0 12px;color:#4caf50">➕ افزودن کاربر جدید</h4>
-                                <form method="post">
-                                    <input type="hidden" name="pk" value="<?php echo h($_POST['pk']); ?>">
-                                    <input type="hidden" name="admin_action" value="add-client">
-                                    <input type="text" name="param1" placeholder="نام کاربر" required>
-                                    <div class="form-row">
-                                        <input type="number" name="param2" placeholder="سهمیه (GB)" min="0" step="0.1" required>
-                                        <input type="number" name="param3" placeholder="مدت (روز)" min="1" required>
-                                    </div>
-                                    <button type="submit" class="btn-success">افزودن کاربر</button>
-                                </form>
-                            </div>
-
-                            <!-- ویرایش کاربر -->
-                            <div class="card" style="padding:15px">
-                                <h4 style="margin:0 0 12px;color:#ff9800">✏️ ویرایش کاربر</h4>
-                                <div id="editForm" class="edit-form">
-                                    <form method="post">
-                                        <input type="hidden" name="pk" value="<?php echo h($_POST['pk']); ?>">
-                                        <input type="hidden" name="admin_action" value="edit-client">
-                                        <input type="hidden" name="param1" id="editClientName">
-                                        <div class="form-row">
-                                            <input type="number" name="param2" id="editClientGB" placeholder="سهمیه جدید (GB)" min="0" step="0.1" required>
-                                            <input type="number" name="param3" id="editClientDays" placeholder="مدت جدید (روز)" required>
-                                        </div>
-                                        <div class="controls">
-                                            <button type="submit" class="btn-warning">ذخیره تغییرات</button>
-                                            <button type="button" onclick="hideEditForm()" class="btn">انصراف</button>
-                                        </div>
-                                    </form>
-                                </div>
-                                <div class="help">برای ویرایش کاربر، از لیست زیر روی دکمه ویرایش کلیک کنید</div>
-                            </div>
-                        </div>
-
-                        <!-- جستجوی کاربران -->
-                        <div class="search-box">
-                            <input type="text" id="searchUsers" placeholder="جستجوی کاربر بر اساس نام..." onkeyup="searchUsers()">
-                            <span class="search-icon">🔍</span>
-                        </div>
-
-                        <!-- لیست کاربران -->
-                        <div class="table-container">
-                            <table id="clientsTable">
-                                <thead>
-                                    <tr>
-                                        <th>نام کاربر</th>
-                                        <th>آدرس IP</th>
-                                        <th>Private Key</th>
-                                        <th>مصرف (GB)</th>
-                                        <th>سقف (GB)</th>
-                                        <th>باقیمانده (GB)</th>
-                                        <th>تاریخ انقضا</th>
-                                        <th>روز باقیمانده</th>
-                                        <th>وضعیت</th>
-                                        <th>عملیات</th>
-                                    </tr>
-                                </thead>
-                                <tbody>
-                                    <?php if (!empty($clients_list)): ?>
-                                        <?php foreach ($clients_list as $client): ?>
-                                            <tr>
-                                                <td><strong><?php echo h($client['name']); ?></strong></td>
-                                                <td><?php echo h($client['ip']); ?></td>
-                                                <td>
-                                                    <div class="key-container">
-                                                        <input type="text" class="private-key" value="<?php echo h($client['private_key']); ?>" readonly>
-                                                        <button class="btn" onclick="showKeyModal(this.parentElement.querySelector('.private-key').value)" title="نمایش کامل" style="width:auto;padding:6px 8px;margin:0">🔍</button>
-                                                    </div>
-                                                </td>
-                                                <td><?php echo h($client['used_gb']); ?></td>
-                                                <td><?php echo h($client['limit_gb']); ?></td>
-                                                <td class="<?php echo ($client['remaining_gb'] === '∞' || $client['remaining_gb'] > 0) ? 'success' : 'error'; ?>">
-                                                    <strong><?php echo h($client['remaining_gb']); ?></strong>
-                                                </td>
-                                                <td><?php echo h($client['expiry']); ?></td>
-                                                <td class="<?php echo ($client['days_remaining'] === '∞' || $client['days_remaining'] > 7) ? 'success' : (($client['days_remaining'] > 0) ? 'warning' : 'error'); ?>">
-                                                    <strong><?php echo h($client['days_remaining']); ?></strong>
-                                                </td>
-                                                <td class="<?php echo ($client['active'] ? 'success' : 'error'); ?>">
-                                                    <?php echo ($client['active'] ? 'فعال' : 'غیرفعال'); ?>
-                                                </td>
-                                                <td>
-                                                    <div class="controls">
-                                                        <?php
-                                                        $client_name_escaped = str_replace("'", "\\'", $client['name']);
-                                                        ?>
-                                                        <button type="button" onclick="showEditForm('<?php echo $client_name_escaped; ?>', <?php echo h($client['limit_gb']); ?>, <?php echo ($client['days_remaining'] === '∞' ? 0 : h($client['days_remaining'])); ?>)"
-                                                            class="btn-warning" style="width:auto;padding:8px 15px;margin:2px;">
-                                                            ✏️ ویرایش
-                                                        </button>
-                                                        <button type="button" onclick="if(confirm('آیا از حذف کاربر <?php echo $client_name_escaped; ?> مطمئن هستید؟')) sendAdminAction('remove-client', '<?php echo $client_name_escaped; ?>')" class="btn-danger" style="width:auto;padding:8px 15px;margin:2px;">🗑️ حذف</button>
-                                                    </div>
-                                                </td>
-                                            </tr>
-                                        <?php endforeach; ?>
-                                    <?php else: ?>
-                                        <tr>
-                                            <td colspan="10" style="text-align:center;padding:20px;">
-                                                📝 هیچ کاربری یافت نشد. اولین کاربر را اضافه کنید.
-                                            </td>
-                                        </tr>
-                                    <?php endif; ?>
-                                </tbody>
-                            </table>
-                        </div>
-                    </div>
-                    <!-- دکمه رفرش -->
-                    <form method="post" id="refreshForm">
-                        <input type="hidden" name="pk" value="<?php echo h($_POST['pk']); ?>">
-                        <button type="button" onclick="refreshUserList(); return false;" class="refresh-btn">🔄 بروزرسانی اطلاعات</button>
-                    </form>
-                    <script>
-                        // تابع رفرش خودکار لیست
-                        function refreshUserList() {
-                            // resolve admin pk robustly
-                            let pkValue = (window.ADMIN_PK && window.ADMIN_PK.length) ? window.ADMIN_PK : '';
-                            if (!pkValue) {
-                                const allPk = Array.from(document.querySelectorAll('input[name="pk"]'));
-                                const filled = allPk.find(i => i && i.value && i.value.trim().length > 0);
-                                pkValue = filled ? filled.value.trim() : '';
-                            }
-                            if (!pkValue) return; // nothing to refresh for non-admin view
-
-                            // نمایش حالت بارگذاری
-                            const refreshBtn = document.querySelector('.refresh-btn');
-                            const originalText = refreshBtn ? refreshBtn.innerHTML : '';
-                            if (refreshBtn) {
-                                refreshBtn.innerHTML = '⏳ در حال بروزرسانی...';
-                                refreshBtn.disabled = true;
-                            }
-
-                            fetch(window.location.href, {
-                                    method: 'POST',
-                                    headers: {
-                                        'Content-Type': 'application/x-www-form-urlencoded',
-                                    },
-                                    body: new URLSearchParams({
-                                        'action': 'refresh',
-                                        'pk': pkValue
-                                    })
-                                })
-                                .then(response => {
-                                    if (!response.ok) {
-                                        throw new Error('Network response was not ok');
-                                    }
-                                    return response.text();
-                                })
-                                .then(html => {
-                                    const tbody = document.querySelector('#clientsTable tbody');
-                                    if (tbody && html.trim()) {
-                                        tbody.innerHTML = html;
-                                        if (refreshBtn) {
-                                            refreshBtn.innerHTML = '✅ بروزرسانی شد';
-                                            setTimeout(() => {
-                                                refreshBtn.innerHTML = originalText;
-                                                refreshBtn.disabled = false;
-                                            }, 1500);
-                                        }
-                                    }
-                                })
-                                .catch((error) => {
-                                    console.error('Error:', error);
-                                    if (refreshBtn) {
-                                        refreshBtn.innerHTML = '❌ خطا در بروزرسانی';
-                                        setTimeout(() => {
-                                            refreshBtn.innerHTML = originalText;
-                                            refreshBtn.disabled = false;
-                                        }, 2000);
-                                    }
-                                });
-                        }
-
-                        // ارسال عملیات مدیریتی به سرور (AJAX) برای حذف/ویرایش بدون لود کامل صفحه
-                        function sendAdminAction(action, param1 = '', param2 = '', param3 = '') {
-                            let pkValue = (window.ADMIN_PK && window.ADMIN_PK.length) ? window.ADMIN_PK : '';
-                            if (!pkValue) {
-                                const allPk = Array.from(document.querySelectorAll('input[name="pk"]'));
-                                const filled = allPk.find(i => i && i.value && i.value.trim().length > 0);
-                                pkValue = filled ? filled.value.trim() : '';
-                            }
-                            if (!pkValue) {
-                                alert('کلید خصوصی مدیر موجود نیست');
-                                console.error('Private key not found in page.');
-                                return;
-                            }
-
-                            console.log('Sending admin action:', action, 'with pk:', pkValue.substring(0, 10) + '...');
-
-                            const body = new URLSearchParams();
-                            body.append('pk', pkValue);
-                            body.append('admin_action', action);
-                            if (param1 !== '') body.append('param1', param1);
-                            if (param2 !== '') body.append('param2', param2);
-                            if (param3 !== '') body.append('param3', param3);
-
-                            console.log('Request body:', body.toString());
-
-                            fetch(window.location.href, {
-                                method: 'POST',
-                                headers: {
-                                    'Content-Type': 'application/x-www-form-urlencoded',
-                                },
-                                body: body.toString()
-                            }).then(response => {
-                                console.log('Response status:', response.status);
-                                if (!response.ok) {
-                                    throw new Error('خطا در ارسال درخواست - Status: ' + response.status);
-                                }
-                                return response.text();
-                            }).then(data => {
-                                console.log('Response received:', data.substring(0, 100));
-                                // بلافاصله بعد از حذف/ویرایش، لیست را رفرش کن
-                                refreshUserList();
-                            }).catch((error) => {
-                                console.error('Error:', error);
-                                alert('خطا در ارسال درخواست مدیریتی: ' + error.message);
-                            });
-                        }
-
-                        // رفرش خودکار هر 30 ثانیه
-                        setInterval(refreshUserList, 30000);
-                    </script>
-                    <!-- تنظیمات سرور -->
-                    <div class="admin-section">
-                        <h3>⚙️ تنظیمات سرور</h3>
-                        <div style="display:grid;grid-template-columns:1fr 1fr;gap:20px">
-                            <div class="card" style="padding:15px">
-                                <h4 style="margin:0 0 12px">🌐 تنظیم Endpoint و DNS</h4>
-                                <form method="post">
-                                    <input type="hidden" name="pk" value="<?php echo h($_POST['pk']); ?>">
-                                    <input type="hidden" name="admin_action" value="set-endpoint">
-                                    <?php
-                                    $current_endpoint = $server_info['endpoint'] ?? 'SERVER_IP:1010';
-                                    $endpoint_parts = explode(':', $current_endpoint);
-                                    $current_domain = $endpoint_parts[0] ?? '';
-                                    $current_port = $endpoint_parts[1] ?? '1010';
-                                    $current_dns = $server_info['dns'] ?? '1.1.1.1,8.8.8.8';
-                                    ?>
-                                    <input type="text" name="param1" placeholder="دامنه یا IP سرور" required value="<?php echo h($current_domain); ?>">
-                                    <div class="form-row">
-                                        <input type="number" name="param2" placeholder="پورت" min="1" max="65535" required value="<?php echo h($current_port); ?>">
-                                        <input type="text" name="param3" placeholder="DNS سرورها" required value="<?php echo h($current_dns); ?>">
-                                    </div>
-                                    <button type="submit">بروزرسانی تنظیمات</button>
-                                </form>
-                            </div>
-
-                            <div class="card" style="padding:15px">
-                                <h4 style="margin:0 0 12px">💾 پشتیبان‌گیری و بازیابی</h4>
-                                <form method="post" style="margin-bottom:8px">
-                                    <input type="hidden" name="pk" value="<?php echo h($_POST['pk']); ?>">
-                                    <input type="hidden" name="admin_action" value="backup">
-                                    <button type="submit" style="width:100%">💾 ایجاد پشتیبان</button>
-                                </form>
-                                <form method="post" enctype="multipart/form-data">
-                                    <input type="hidden" name="pk" value="<?php echo h($_POST['pk']); ?>">
-                                    <input type="hidden" name="admin_action" value="restore">
-                                    <input type="file" name="backup_file" accept=".tar.gz,.gz" required style="margin-bottom:8px">
-                                    <button type="submit" style="width:100%;background:linear-gradient(135deg, #9c27b0, #7b1fa2)">🔄 بازیابی پشتیبان</button>
-                                </form>
-                            </div>
-                        </div>
-                    </div>
-                </div>
-
-            <?php else: ?>
-                <!-- پنل کاربر عادی -->
-                <div class="two-column">
-                    <div>
-                        <div class="card">
-                            <?php
-                            // Provide weekly usage data for the current user to the chart (window.USER_USAGE)
-                            $__tmp = get_weekly_usage($data['client_name'] ?? '');
-                            echo '<script>window.USER_USAGE=' . json_encode($__tmp, JSON_UNESCAPED_UNICODE|JSON_UNESCAPED_SLASHES) . ';</script>';
-                            ?>
-                            <div class="usage-chart-container">
-                        <div class="chart-header">
-                            <h3 style="margin: 0">📈 نمودار مصرف روزانه</h3>
-                        </div>
-                        <div class="chart-wrapper">
-                            <canvas id="usageChart" width="1375" height="200" style="display: block; box-sizing: border-box; height: 200px; width: 1375.4px;"></canvas>
-                        </div>
-                    </div>
-                            <div class="grid">
-                                
-                                <div class="stat">
-                                    <div class="label">👤 کاربر</div>
-                                    <div class="value"><?php echo h($data['client_name']); ?></div>
-                                </div>
-                                <div class="stat">
-                                    <div class="label">🌐 آدرس IP</div>
-                                    <div class="value"><?php echo h($data['ip_address']); ?></div>
-                                </div>
-                                <div class="stat">
-                                    <div class="label">📊 مصرف شده</div>
-                                    <div class="value"><?php echo h($data['data_used']); ?> GB</div>
-                                </div>
-                                <div class="stat">
-                                    <div class="label">📈 سقف مصرف</div>
-                                    <div class="value"><?php echo h($data['data_limit']); ?> GB</div>
-                                </div>
-                                <div class="stat">
-                                    <div class="label">📉 باقیمانده</div>
-                                    <div class="value <?php echo ($data['remaining_data'] == 'Unlimited' ? 'success' : (floatval($data['remaining_data']) > 0 ? '' : 'error')); ?>">
-                                        <?php echo h($data['remaining_data']); ?> GB
-                                    </div>
-                                </div>
-                                <div class="stat">
-                                    <div class="label">📊 درصد مصرف</div>
-                                    <div class="value <?php echo (floatval($data['usage_percent']) < 80 ? 'success' : (floatval($data['usage_percent']) < 95 ? 'warning' : 'error')); ?>">
-                                        <?php echo h($data['usage_percent']); ?>%
-                                    </div>
-                                </div>
-                                <div class="stat">
-                                    <div class="label">📅 تاریخ انقضا</div>
-                                    <div class="value"><?php echo h($data['expiry_date']); ?></div>
-                                </div>
-                                <div class="stat">
-                                    <div class="label">⏳ روزهای باقیمانده</div>
-                                    <div class="value <?php echo ($data['days_remaining'] > 7 ? 'success' : ($data['days_remaining'] > 0 ? 'warning' : 'error')); ?>">
-                                        <?php echo h($data['days_remaining']); ?> روز
-                                    </div>
-                                </div>
-                                <div class="stat">
-                                    <div class="label">🔐 وضعیت</div>
-                                    <div class="value <?php echo ($data['is_active'] ? 'success' : 'error'); ?>">
-                                        <?php echo ($data['is_active'] ? 'فعال' : 'غیرفعال'); ?>
-                                    </div>
-                                </div>
-                            </div>
-                            
-                        </div>
-
-                        <div class="card">
-                            <h2>📄 اطلاعات کانفیگ</h2>
-                            <div class="config-section">
-                                <pre class="config-code">[Interface]
-PrivateKey = <?php echo h($_POST['pk']); ?> 
-Address = <?php echo h($data['ip_address']); ?>/24
-DNS = <?php echo h($data['server_dns'] ?? '1.1.1.1,8.8.8.8'); ?> 
-MTU = 1420
-
-[Peer]
-PublicKey = <?php echo h($data['server_public_key']); ?> 
-Endpoint = <?php echo h($data['server_endpoint']); ?> 
-AllowedIPs = 0.0.0.0/0, ::/0
-PersistentKeepalive = 25</pre>
-                            </div>
-                            <div class="help">
-                                💡 این اطلاعات برای اتصال شما ضروری است. می‌توانید از آن برای تنظیم دستی کلاینت استفاده کنید.
-                            </div>
-                        </div>
-                    </div>
-                    <div>
-                        <?php if (!empty($qr_code)): ?>
-                            <div class="card" style="display: inline-grid;margin-right: 355px;">
-                                <h2>📱 QR Code</h2>
-                                <div class="qr-container">
-                                    <img src="data:image/png;base64,<?php echo $qr_code; ?>" alt="QR Code" class="qr-image">
-                                </div>
-                                <div class="help">
-                                    📸 این QR Code را با اپلیکیشن WireGuard اسکن کنید تا به طور خودکار تنظیم شود.
-                                </div>
-                            </div>
-                        <?php else: ?>
-                            <div class="card">
-                                <h2>📱 QR Code</h2>
-                                <div class="message warning">
-                                    ❌ تولید QR Code با مشکل مواجه شد. لطفاً از فایل کانفیگ استفاده کنید.
-                                </div>
-                            </div>
-                        <?php endif; ?>
-                    </div>
-                </div>
-            <?php endif; ?>
-
-        <?php elseif (!empty($msg)): ?>
-            <div class="card">
-                <div class="message error">
-                    ❌ <?php echo h($msg); ?>
-                </div>
-            </div>
-        <?php endif; ?>
-    </div>
-    <script src="/assets/admin-debug-link.js"></script>
 </body>
-
 </html>
+
+
+
 PHP
 
     # Set file permissions
