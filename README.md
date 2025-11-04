@@ -1,5 +1,12 @@
 # 🔐 WireGuard Sale Panel | پنل فروش وایرگارد
 
+<img width="1680" height="915" alt="image" src="https://github.com/user-attachments/assets/160575ce-a775-4829-84af-180181a66568" />
+
+<img width="1680" height="2005" alt="image" src="https://github.com/user-attachments/assets/a7a623ea-ef95-4387-82b9-9ed001bffb63" />
+
+<img width="1680" height="1369" alt="image" src="https://github.com/user-attachments/assets/cdad4651-e34c-4eae-a724-9b33e372e338" />
+
+
 ---
 
 ## 🔧 پیش‌نیازها
