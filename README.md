@@ -73,3 +73,17 @@ sudo visudo
 ```int
 www-data ALL=(ALL) NOPASSWD: /bin/systemctl status wg-quick@wg0, /bin/systemctl is-active wg-quick@wg0, /usr/bin/wg show wg0 dump, /bin/ip link show wg0, /bin/ping
 ```
+
+
+<img width="1920" height="1425" alt="image" src="https://github.com/user-attachments/assets/9a50ec33-b909-483b-8330-029e9f3a1d15" />
+<img width="1920" height="2209" alt="image" src="https://github.com/user-attachments/assets/1d01995d-8fb3-42cd-890d-ba6890e413f1" />
+<img width="1920" height="945" alt="image" src="https://github.com/user-attachments/assets/cba324dc-d2b1-4263-ade0-4caba6f91bde" />
+<img width="1920" height="1635" alt="image" src="https://github.com/user-attachments/assets/5fb3a7f3-c472-4125-94a8-b07efded8e93" />
+<img width="1920" height="1697" alt="image" src="https://github.com/user-attachments/assets/9bcd3814-0e16-4145-92bd-0949a5fd4e34" />
+
+
+
+
+
+
+
