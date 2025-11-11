@@ -2557,7 +2557,7 @@ CRON
     # Create PHP file (Persian interface)
     # [PHP content remains the same as original]
     cat > "$WEB_DIR/index.php" <<'PHP'
- <?php
+  <?php
 ob_start(); // شروع output buffering
 
 function h($s)
@@ -2571,6 +2571,7 @@ $data = null;
 $qr_code = "";
 $is_admin = false;
 $admin_message = "";
+$backup_list = array(); // لیست بک‌اپ‌ها برای استفاده در HTML
 $clients_list = array();
 $server_info = array();
 
@@ -2612,26 +2613,36 @@ function get_server_info()
     }
 
     // Force fresh status check every time - no caching
-    // Use custom script to avoid sudo password issues
-    $status_output = @shell_exec('sudo /usr/local/bin/wg-service-control is-active 2>&1');
-    $status = trim($status_output ?: 'unknown');
-    
-    // Log for debugging if needed
-    error_log("WireGuard status check: raw='" . $status_output . "' trimmed='" . $status . "'");
-    
-    // تبدیل خروجی های مختلف به active یا inactive
-    if (in_array($status, ['active', 'activating'])) {
-        $status = 'active';
-    } elseif (in_array($status, ['inactive', 'failed', 'deactivating', 'unknown'])) {
-        $status = 'inactive';
+    // 1) Check if wg0 interface is UP (does not require root)
+    $interface_check = @shell_exec('ip link show wg0 2>/dev/null | grep -E "<.*UP.*>" 2>/dev/null');
+    $interface_exists = !empty($interface_check);
+
+    // 2) Check systemd service status. Querying status doesn't require sudo.
+    $status_output = @shell_exec('systemctl is-active wg-quick@wg0 2>/dev/null');
+    $systemd_status = trim($status_output ?: 'unknown');
+
+    // If systemctl isn't available (containers without systemd), or previous call failed, try sudo -n as a last resort
+    if ($systemd_status === 'unknown' || $systemd_status === '') {
+    $status_output = @shell_exec('sudo -n /usr/bin/systemctl is-active wg-quick@wg0 2>&1');
+        // Avoid treating sudo error text as a real status
+        if (!empty($status_output) && stripos($status_output, 'sudo:') === false) {
+            $systemd_status = trim($status_output);
+        }
     }
-    
-    // Additional verification - check if WG interface exists
-    if ($status === 'active') {
-        $wg_check = @shell_exec('wg show wg0 2>/dev/null');
-        if (empty($wg_check)) {
-            error_log("WireGuard service active but no interface found");
-            // Keep status as active since systemctl reports it as such
+
+    error_log("WireGuard status check: interface_exists=" . ($interface_exists ? 'yes' : 'no') . ", systemd=" . $systemd_status);
+
+    // Determine final status: be permissive to avoid false negatives on systems without systemd
+    // Consider the service active if EITHER the interface is UP OR systemd reports active/activating
+    if ($interface_exists || in_array($systemd_status, ['active', 'activating'], true)) {
+        $status = 'active';
+    } else {
+        $status = 'inactive';
+        if (!$interface_exists) {
+            error_log("WireGuard interface wg0 not found or not UP");
+        }
+        if (!in_array($systemd_status, ['active', 'activating'], true)) {
+            error_log("WireGuard systemd service not active: " . $systemd_status);
         }
     }
 
@@ -2643,40 +2654,315 @@ function get_server_info()
     );
 }
 
+// تابع دریافت اطلاعات Geolocation از IP
+function get_ip_geolocation($ip) {
+    if (empty($ip) || $ip === '127.0.0.1' || $ip === '::1') {
+        return null;
+    }
+    
+    // استفاده از ip-api.com (رایگان تا 45 درخواست در دقیقه)
+    $api_url = "http://ip-api.com/json/{$ip}?fields=status,message,country,countryCode,region,city,lat,lon,isp,query";
+    
+    $ch = curl_init();
+    curl_setopt($ch, CURLOPT_URL, $api_url);
+    curl_setopt($ch, CURLOPT_RETURNTRANSFER, true);
+    curl_setopt($ch, CURLOPT_TIMEOUT, 5);
+    $response = curl_exec($ch);
+    curl_close($ch);
+    
+    if ($response === false) {
+        return null;
+    }
+    
+    $data = json_decode($response, true);
+    
+    if ($data && $data['status'] === 'success') {
+        return array(
+            'ip' => $data['query'],
+            'country' => $data['country'] ?? 'Unknown',
+            'countryCode' => $data['countryCode'] ?? '',
+            'region' => $data['region'] ?? '',
+            'city' => $data['city'] ?? '',
+            'lat' => $data['lat'] ?? 0,
+            'lon' => $data['lon'] ?? 0,
+            'isp' => $data['isp'] ?? ''
+        );
+    }
+    
+    return null;
+}
+
+// تابع بهبود یافته برای محاسبه ping
+function get_client_latency($client_ip) {
+    if (empty($client_ip) || $client_ip === '10.0.0.1') {
+        return null;
+    }
+    
+    // پینگ با timeout کوتاه
+    $output = shell_exec("timeout 2 ping -c 1 -W 1 " . escapeshellarg($client_ip) . " 2>&1");
+    
+    if (preg_match('/time=([0-9.]+)\s*ms/', $output, $matches)) {
+        return round(floatval($matches[1]), 1);
+    }
+    
+    // روش جایگزین با استفاده از tcpping اگر موجود باشد
+    $output = shell_exec("timeout 2 tcpping -c 1 " . escapeshellarg($client_ip) . " 2>&1");
+    if (preg_match('/time=([0-9.]+)\s*ms/', $output, $matches)) {
+        return round(floatval($matches[1]), 1);
+    }
+    
+    return null;
+}
+
+
+
+// تابع بهبود یافته برای دریافت کاربران فعال با اطلاعات جغرافیایی
+function get_active_clients_with_geo() {
+    $clients = get_clients_list();
+    $active_clients = array();
+    
+    error_log("=== get_active_clients_with_geo Debug ===");
+    error_log("Total clients from DB: " . count($clients));
+    
+    // دریافت اطلاعات فعال کاربران از wg show
+    // Try without sudo first (reading status usually doesn't need root). Fallback to sudo -n if needed.
+    $wg_output = @shell_exec("wg show wg0 dump 2>/dev/null");
+    if (empty($wg_output)) {
+    $wg_output = @shell_exec("sudo -n /usr/bin/wg show wg0 dump 2>&1");
+        // If sudo prompts/denies, ignore the output
+        if (!empty($wg_output) && stripos($wg_output, 'sudo:') !== false) {
+            $wg_output = '';
+        }
+    }
+    $active_peers = array();
+    
+    if (!empty($wg_output)) {
+        $lines = explode("\n", $wg_output);
+        error_log("wg show lines: " . count($lines));
+        
+        for ($i = 1; $i < count($lines); $i++) {
+            $line = trim($lines[$i]);
+            if (empty($line)) continue;
+            
+            $parts = preg_split('/\s+/', $line);
+            
+            if (count($parts) >= 5) {
+                $public_key = $parts[0];
+                $endpoint = $parts[2];
+                $allowed_ips = $parts[3];
+                $last_handshake = intval($parts[4]);
+                $transfer_rx = isset($parts[5]) ? intval($parts[5]) : 0;
+                $transfer_tx = isset($parts[6]) ? intval($parts[6]) : 0;
+                
+                $current_time = time();
+                $handshake_age = $current_time - $last_handshake;
+                
+                error_log("Peer: key={$public_key}, endpoint={$endpoint}, allowed_ips={$allowed_ips}, handshake_age={$handshake_age}s");
+                
+                // شرط ساده‌تر برای تشخیص کاربران فعال
+                // هر کاربری که handshake داشته یا ترافیک رد و بدل کرده باشد
+                $is_active = false;
+                
+                if ($last_handshake > 0 && $handshake_age < 300) { // 5 دقیقه
+                    $is_active = true;
+                    error_log("Active by handshake: {$handshake_age}s");
+                } elseif (($transfer_rx + $transfer_tx) > 0) {
+                    $is_active = true;
+                    error_log("Active by traffic: RX={$transfer_rx}, TX={$transfer_tx}");
+                }
+                
+                if ($is_active) {
+                    // استخراج IP از allowed_ips
+                    if (preg_match('/^(\d+\.\d+\.\d+\.\d+)\//', $allowed_ips, $matches)) {
+                        $client_ip = $matches[1];
+                        
+                        // استخراج IP واقعی از endpoint
+                        $endpoint_ip = $client_ip; // fallback
+                        if ($endpoint !== '(none)' && preg_match('/^(\d+\.\d+\.\d+\.\d+):/', $endpoint, $ep_matches)) {
+                            $endpoint_ip = $ep_matches[1];
+                        }
+                        
+                        $active_peers[$client_ip] = array(
+                            'public_key' => $public_key,
+                            'endpoint_ip' => $endpoint_ip,
+                            'last_handshake' => $last_handshake,
+                            'handshake_age' => $handshake_age,
+                            'transfer_rx' => $transfer_rx,
+                            'transfer_tx' => $transfer_tx
+                        );
+                        
+                        error_log("Active peer added: $client_ip -> $endpoint_ip (age: $handshake_age sec, RX: " . formatBytes($transfer_rx) . ", TX: " . formatBytes($transfer_tx) . ")");
+                    }
+                }
+            }
+        }
+    }
+    
+    error_log("Active peers found in wg show: " . count($active_peers));
+    
+    // تطبیق با لیست کاربران
+    foreach ($clients as $client) {
+        $client_ip = $client['ip'];
+        
+        // اگر کاربر در لیست فعال‌ها باشد
+        if (isset($active_peers[$client_ip])) {
+            $peer_info = $active_peers[$client_ip];
+            $endpoint_ip = $peer_info['endpoint_ip'];
+            
+            error_log("Processing active client: {$client['name']} ({$client_ip})");
+            
+            // دریافت اطلاعات جغرافیایی
+            $geo = get_ip_geolocation($endpoint_ip);
+            
+            // دریافت latency
+            $latency = null;
+            if ($endpoint_ip && $endpoint_ip !== $client_ip) {
+                $latency = @get_client_latency($endpoint_ip);
+            }
+            
+            // اگر نتوانستیم از endpoint پینگ بگیریم، از IP کاربر پینگ بگیریم
+            if ($latency === null) {
+                $latency = @get_client_latency($client_ip);
+            }
+            
+            $active_clients[] = array(
+                'name' => $client['name'],
+                'ip' => $client_ip,
+                'endpoint_ip' => $endpoint_ip,
+                'geo' => $geo,
+                'latency' => $latency,
+                'used_gb' => $client['used_gb'],
+                'limit_gb' => $client['limit_gb'],
+                'last_handshake' => $peer_info['last_handshake'],
+                'handshake_age' => $peer_info['handshake_age'],
+                'transfer_rx' => $peer_info['transfer_rx'],
+                'transfer_tx' => $peer_info['transfer_tx']
+            );
+            
+            error_log("Added to active clients: {$client['name']}");
+        } else {
+            error_log("Client {$client['name']} ({$client_ip}) not in active peers");
+        }
+    }
+    
+    error_log("Final active clients: " . count($active_clients));
+    error_log("=== End Debug ===");
+    
+    return $active_clients;
+}
+
+// تابع بهبود یافته برای خواندن داده‌های مصرف هفتگی
+function get_weekly_usage_detailed($username, $days = 7) {
+    $labels = array();
+    $upload_data = array();
+    $download_data = array();
+    $total_data = array();
+    
+    for ($i = $days - 1; $i >= 0; $i--) {
+        $ts = time() - ($i * 86400);
+        $date = date('Y-m-d', $ts);
+        $labels[] = date('Y/m/d', $ts);
+        
+        $csv = '/etc/wireguard/usage/' . $date . '.csv';
+        $bytes = 0;
+        $upload_bytes = 0;
+        $download_bytes = 0;
+        
+        if (is_readable($csv)) {
+            $lines = @file($csv, FILE_IGNORE_NEW_LINES | FILE_SKIP_EMPTY_LINES);
+            if ($lines !== false) {
+                foreach ($lines as $line) {
+                    // فرمت: username|total_bytes|upload_bytes|download_bytes
+                    $parts = explode('|', trim($line));
+                    if (count($parts) >= 2 && $parts[0] === $username) {
+                        $bytes = is_numeric($parts[1]) ? intval($parts[1]) : 0;
+                        
+                        // اگر upload/download جدا ذخیره شده باشد
+                        if (count($parts) >= 4) {
+                            $upload_bytes = is_numeric($parts[2]) ? intval($parts[2]) : 0;
+                            $download_bytes = is_numeric($parts[3]) ? intval($parts[3]) : 0;
+                        } else {
+                            // تخمین 40% upload, 60% download
+                            $upload_bytes = intval($bytes * 0.4);
+                            $download_bytes = intval($bytes * 0.6);
+                        }
+                        break;
+                    }
+                }
+            }
+        }
+        
+        $total_data[] = round($bytes / (1024 * 1024 * 1024), 2);
+        $upload_data[] = round($upload_bytes / (1024 * 1024 * 1024), 2);
+        $download_data[] = round($download_bytes / (1024 * 1024 * 1024), 2);
+    }
+    
+    return array(
+        'labels' => $labels,
+        'total' => $total_data,
+        'upload' => $upload_data,
+        'download' => $download_data
+    );
+}
+
 // دریافت لیست کاربران
 function get_clients_list()
 {
     $clients = array();
-    // /etc is primary source
-    $client_db = '/etc/wireguard/clients.db';
-    $quota_db = '/etc/wireguard/quota.db';
-    $clients_dir = '/etc/wireguard/clients';
-
-    // Fallback to web if /etc missing
-    if (!file_exists($client_db)) {
-        $client_db = '/var/www/wireguard/db/clients.db';
+    
+    // تلاش برای یافتن clients.db - اول web، بعد /etc
+    $possible_paths = [
+        '/var/www/wireguard/db/clients.db',
+        '/etc/wireguard/clients.db'
+    ];
+    
+    $client_db = null;
+    foreach ($possible_paths as $path) {
+        if (file_exists($path)) {
+            $client_db = $path;
+            error_log("Found clients.db at: $path");
+            break;
+        }
+    }
+    
+    if (!$client_db) {
+        error_log("ERROR: clients.db not found in any location!");
+        return $clients;
+    }
+    
+    // مسیرهای مرتبط
+    $clients_dir = dirname($client_db) . '/clients';
+    if (!is_dir($clients_dir)) {
         $clients_dir = '/var/www/wireguard/clients';
     }
+    
+    $quota_db = dirname($client_db) . '/quota.db';
     if (!file_exists($quota_db)) {
         $quota_db = '/var/www/wireguard/db/quota.db';
     }
+    
+    error_log("Using clients_dir: $clients_dir");
+    error_log("Using quota_db: $quota_db");
 
-    if (!file_exists($client_db)) return $clients;
-
-    $lines = file($client_db, FILE_IGNORE_NEW_LINES | FILE_SKIP_EMPTY_LINES);
+    $lines = @file($client_db, FILE_IGNORE_NEW_LINES | FILE_SKIP_EMPTY_LINES);
+    if (!$lines) {
+        error_log("ERROR: Could not read clients.db");
+        return $clients;
+    }
+    
     foreach ($lines as $line) {
         if (strpos($line, '#') === 0) continue;
         $parts = explode('|', $line);
         if (count($parts) < 5) continue;
 
         $name = $parts[0];
-        $private_key = $parts[1];  // استخراج private key از دیتابیس
+        $private_key = $parts[1];
         $ip = $parts[3];
         $created = $parts[4];
 
         // بررسی و خواندن private key از فایل اگر در دیتابیس نباشد
         if (empty($private_key)) {
-            $key_file = $clients_dir . "/${name}_private.key";
+            $key_file = $clients_dir . "/{$name}_private.key";
             if (file_exists($key_file)) {
                 $private_key = trim(file_get_contents($key_file));
             }
@@ -2689,24 +2975,26 @@ function get_clients_list()
         $active = 1;
 
         if (file_exists($quota_db)) {
-            $quota_lines = file($quota_db, FILE_IGNORE_NEW_LINES | FILE_SKIP_EMPTY_LINES);
-            foreach ($quota_lines as $qline) {
-                if (strpos($qline, $name . '|') === 0) {
-                    $qparts = explode('|', $qline);
-                    if (count($qparts) >= 5) {
-                        $used = floatval($qparts[1]);
-                        $limit = floatval($qparts[2]);
-                        $expiry = $qparts[3];
-                        $active = intval($qparts[4]);
+            $quota_lines = @file($quota_db, FILE_IGNORE_NEW_LINES | FILE_SKIP_EMPTY_LINES);
+            if ($quota_lines !== false) {
+                foreach ($quota_lines as $qline) {
+                    if (strpos($qline, $name . '|') === 0) {
+                        $qparts = explode('|', trim($qline));
+                        if (count($qparts) >= 5) {
+                            $used = is_numeric($qparts[1]) ? floatval($qparts[1]) : 0;
+                            $limit = is_numeric($qparts[2]) ? floatval($qparts[2]) : 0;
+                            $expiry = trim($qparts[3]);
+                            $active = is_numeric($qparts[4]) ? intval($qparts[4]) : 1;
+                        }
+                        break;
                     }
-                    break;
                 }
             }
         }
 
         // محاسبات
-        $used_gb = round($used / 1024 / 1024 / 1024, 2);
-        $limit_gb = round($limit / 1024 / 1024 / 1024, 2);
+        $used_gb = $used > 0 ? round($used / 1024 / 1024 / 1024, 2) : 0;
+        $limit_gb = $limit > 0 ? round($limit / 1024 / 1024 / 1024, 2) : 0;
         $remaining_gb = $limit > 0 ? round(($limit - $used) / 1024 / 1024 / 1024, 2) : '∞';
 
         // محاسبه روزهای باقیمانده
@@ -2719,17 +3007,12 @@ function get_clients_list()
             $days_remaining = '∞';
         }
 
-        // خواندن کلید خصوصی
-        $private_key = '';
-        $private_key_file = "/var/www/wireguard/clients/{$name}_private.key";
-        if (file_exists($private_key_file)) {
-            $private_key = trim(file_get_contents($private_key_file));
-        }
-
         $clients[] = array(
             'name' => $name,
             'ip' => $ip,
             'private_key' => $private_key,
+            'used' => $used,
+            'limit' => $limit,
             'used_gb' => $used_gb,
             'limit_gb' => $limit_gb,
             'remaining_gb' => $remaining_gb,
@@ -3158,6 +3441,8 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
     $pk = trim($_POST['pk'] ?? '');
     
     // Debug logging
+    file_put_contents('/tmp/wireguard_debug.log', "[" . date('Y-m-d H:i:s') . "] POST Request - PK present: " . (!empty($pk) ? "yes (length: " . strlen($pk) . ")" : "no") . "\n", FILE_APPEND);
+    file_put_contents('/tmp/wireguard_debug.log', "[" . date('Y-m-d H:i:s') . "] POST Request - Action: " . ($_POST['action'] ?? $_POST['admin_action'] ?? 'none') . "\n", FILE_APPEND);
     error_log("POST Request - PK present: " . (!empty($pk) ? "yes" : "no"));
     error_log("POST Request - Action: " . ($_POST['action'] ?? $_POST['admin_action'] ?? 'none'));
     
@@ -3166,23 +3451,52 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
     error_log("Sudo test result: " . ($test_sudo ?: "failed"));
 
     if (!empty($pk)) {
-        $admin_check_cmd = "sudo /usr/local/bin/wg-admin-is-admin " . escapeshellarg($pk);
-        error_log("Running command: $admin_check_cmd");
-        $admin_output = shell_exec($admin_check_cmd . " 2>&1");
-        error_log("Admin check raw output: " . ($admin_output ?: "empty"));
-        // Only trust the last line as the boolean result
-        $admin_lines = preg_split("/\r?\n/", trim((string)$admin_output));
-        $admin_last = strtolower(trim(end($admin_lines) ?: ''));
-        $is_admin = ($admin_last === 'true');
+        // Inline admin check — compare provided PK to stored admin private key
+        $admin_key_file = __DIR__ . '/clients/admin_private.key';
+        $is_admin = false;
         
-        error_log("Admin check result (parsed): " . ($is_admin ? "true" : "false"));
+        file_put_contents('/tmp/wireguard_debug.log', "[" . date('Y-m-d H:i:s') . "] Admin check - File path: " . $admin_key_file . "\n", FILE_APPEND);
+        file_put_contents('/tmp/wireguard_debug.log', "[" . date('Y-m-d H:i:s') . "] Admin check - File exists: " . (file_exists($admin_key_file) ? "yes" : "no") . "\n", FILE_APPEND);
+        
+        if (file_exists($admin_key_file) && is_readable($admin_key_file)) {
+            $admin_key = trim(@file_get_contents($admin_key_file));
+            file_put_contents('/tmp/wireguard_debug.log', "[" . date('Y-m-d H:i:s') . "] Admin check - Stored key length: " . strlen($admin_key) . "\n", FILE_APPEND);
+            file_put_contents('/tmp/wireguard_debug.log', "[" . date('Y-m-d H:i:s') . "] Admin check - Provided PK length: " . strlen($pk) . "\n", FILE_APPEND);
+            file_put_contents('/tmp/wireguard_debug.log', "[" . date('Y-m-d H:i:s') . "] Admin check - Keys match: " . ($pk === $admin_key ? "yes" : "no") . "\n", FILE_APPEND);
+            
+            if ($admin_key !== '' && $pk === $admin_key) {
+                $is_admin = true;
+            }
+        }
+        file_put_contents('/tmp/wireguard_debug.log', "[" . date('Y-m-d H:i:s') . "] Admin check result (inline): " . ($is_admin ? "true" : "false") . "\n", FILE_APPEND);
+        error_log("Admin check result (inline): " . ($is_admin ? "true" : "false"));
+
+        // پردازش عملیات مدیریتی - باید برای AJAX calls بدون صفحه سازی اول بسط داده شود
+        if (isset($_POST['admin_action']) && $_POST['admin_action'] === 'get-active-clients-geo') {
+            if (!$is_admin) {
+                http_response_code(403);
+                echo json_encode(['status' => 'error', 'message' => 'Forbidden'], JSON_UNESCAPED_UNICODE);
+                exit;
+            }
+            
+            if (ob_get_level()) {
+                ob_end_clean();
+            }
+            
+            $active_clients = get_active_clients_with_geo();
+            
+            header('Content-Type: application/json; charset=utf-8');
+            echo json_encode([
+                'status' => 'success',
+                'clients' => $active_clients
+            ], JSON_UNESCAPED_UNICODE);
+            exit;
+        }
 
     if ($is_admin) {
             $ok = true;
             $data = array('client_name' => 'مدیر سیستم', 'ip_address' => 'N/A', 'is_admin' => true);
-            // Expose admin PK to JS for subsequent AJAX calls
-            echo "<script>window.ADMIN_PK='" . htmlspecialchars($pk, ENT_QUOTES, 'UTF-8') . "';</script>";
-
+            
             // دریافت لیست کاربران
             $clients_list = get_clients_list();
             $server_info = get_server_info();
@@ -3234,7 +3548,7 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
                 $param3 = $_POST['param3'] ?? '';
                 
                 error_log("Admin Action: $action, Param1: $param1");
-
+                
                 // پردازش بروزرسانی endpoint و DNS
                 if ($action === 'set-endpoint') {
                     $domain = $param1 ?? '';
@@ -3337,6 +3651,11 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
                         $download_file = '/tmp/download-' . basename($backup_file);
                         copy($backup_file, $download_file);
                         
+                        // ✅ پاک کردن output buffer قبل از ارسال فایل
+                        while (ob_get_level()) {
+                            ob_end_clean();
+                        }
+                        
                         header('Content-Type: application/octet-stream');
                         header('Content-Disposition: attachment; filename="' . basename($backup_file) . '"');
                         header('Content-Length: ' . filesize($download_file));
@@ -3354,8 +3673,38 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
                         $admin_message = "پشتیبان با موفقیت ایجاد شد: " . basename($backup_file);
                         // بروزرسانی لیست backup ها
                         $backup_list = get_backup_list();
+                        // پاسخ JSON در صورت AJAX
+                        $is_ajax = isset($_SERVER['HTTP_X_REQUESTED_WITH']) && 
+                                   strtolower($_SERVER['HTTP_X_REQUESTED_WITH']) === 'xmlhttprequest';
+                        if ($is_ajax) {
+                            if (ob_get_level()) { ob_end_clean(); }
+                            header('Content-Type: application/json; charset=utf-8');
+                            echo json_encode([
+                                'status' => 'success',
+                                'message' => $admin_message,
+                                'backups' => array_map(function($b){
+                                    return [
+                                        'filename' => $b['filename'],
+                                        'date' => $b['date'],
+                                        'size' => $b['size_formatted']
+                                    ];
+                                }, $backup_list)
+                            ], JSON_UNESCAPED_UNICODE);
+                            exit;
+                        }
                     } else {
                         $admin_message = "خطا در ایجاد پشتیبان";
+                        $is_ajax = isset($_SERVER['HTTP_X_REQUESTED_WITH']) && 
+                                   strtolower($_SERVER['HTTP_X_REQUESTED_WITH']) === 'xmlhttprequest';
+                        if ($is_ajax) {
+                            if (ob_get_level()) { ob_end_clean(); }
+                            header('Content-Type: application/json; charset=utf-8');
+                            echo json_encode([
+                                'status' => 'error',
+                                'message' => $admin_message
+                            ], JSON_UNESCAPED_UNICODE);
+                            exit;
+                        }
                     }
                 }
                 // پردازش بازنشانی
@@ -3373,11 +3722,51 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
                             $clients_list = get_clients_list();
                             $server_info = get_server_info();
                             $backup_list = get_backup_list();
+                            $is_ajax = isset($_SERVER['HTTP_X_REQUESTED_WITH']) && 
+                                       strtolower($_SERVER['HTTP_X_REQUESTED_WITH']) === 'xmlhttprequest';
+                            if ($is_ajax) {
+                                if (ob_get_level()) { ob_end_clean(); }
+                                header('Content-Type: application/json; charset=utf-8');
+                                echo json_encode([
+                                    'status' => (strpos($restore_result,'خطا')!==false?'error':'success'),
+                                    'message' => $admin_message,
+                                    'backups' => array_map(function($b){
+                                        return [
+                                            'filename' => $b['filename'],
+                                            'date' => $b['date'],
+                                            'size' => $b['size_formatted']
+                                        ];
+                                    }, $backup_list)
+                                ], JSON_UNESCAPED_UNICODE);
+                                exit;
+                            }
                         } else {
                             $admin_message = "خطا در آپلود فایل پشتیبان";
+                            $is_ajax = isset($_SERVER['HTTP_X_REQUESTED_WITH']) && 
+                                       strtolower($_SERVER['HTTP_X_REQUESTED_WITH']) === 'xmlhttprequest';
+                            if ($is_ajax) {
+                                if (ob_get_level()) { ob_end_clean(); }
+                                header('Content-Type: application/json; charset=utf-8');
+                                echo json_encode([
+                                    'status' => 'error',
+                                    'message' => $admin_message
+                                ], JSON_UNESCAPED_UNICODE);
+                                exit;
+                            }
                         }
                     } else {
                         $admin_message = "لطفا یک فایل پشتیبان انتخاب کنید";
+                        $is_ajax = isset($_SERVER['HTTP_X_REQUESTED_WITH']) && 
+                                   strtolower($_SERVER['HTTP_X_REQUESTED_WITH']) === 'xmlhttprequest';
+                        if ($is_ajax) {
+                            if (ob_get_level()) { ob_end_clean(); }
+                            header('Content-Type: application/json; charset=utf-8');
+                            echo json_encode([
+                                'status' => 'error',
+                                'message' => $admin_message
+                            ], JSON_UNESCAPED_UNICODE);
+                            exit;
+                        }
                     }
                 }
                 // دانلود بک‌اپ ذخیره شده
@@ -3396,6 +3785,11 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
                         
                         if (file_exists($backup_file) && strpos($filename, 'wireguard-backup-') === 0 && substr($filename, -7) === '.tar.gz') {
                             error_log("شروع دانلود backup: " . $filename . " (" . filesize($backup_file) . " بایت)");
+                            
+                            // ✅ پاک کردن output buffer قبل از ارسال فایل
+                            while (ob_get_level()) {
+                                ob_end_clean();
+                            }
                             
                             header('Content-Type: application/octet-stream');
                             header('Content-Disposition: attachment; filename="' . $filename . '"');
@@ -3717,10 +4111,10 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
                 // پردازش عملیات مدیریت سرویس
                 elseif ($action === 'start-service' || $action === 'stop-service' || $action === 'restart-service' || $action === 'update-status') {
                     $service_commands = [
-                        'start-service' => '/usr/local/bin/wg-service-control start',
-                        'stop-service' => '/usr/local/bin/wg-service-control stop',
-                        'restart-service' => '/usr/local/bin/wg-service-control restart',
-                        'update-status' => '/usr/local/bin/wg-service-control is-active'
+                        'start-service' => 'systemctl start wg-quick@wg0',
+                        'stop-service' => 'systemctl stop wg-quick@wg0',
+                        'restart-service' => 'systemctl restart wg-quick@wg0',
+                        'update-status' => 'systemctl is-active wg-quick@wg0'
                     ];
                     
                     $service_messages = [
@@ -4012,6 +4406,9 @@ header('Content-Type: text/html; charset=utf-8');
     <meta name="viewport" content="width=device-width, initial-scale=1">
     <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
     <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.4.0/css/all.min.css">
+    <!-- Leaflet.js برای نقشه -->
+<link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css" />
+<script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
     <title>پنل حرفه‌ای مدیریت WireGuard</title>
     <style>
         :root {
@@ -4880,6 +5277,11 @@ header('Content-Type: text/html; charset=utf-8');
             to { opacity: 1; transform: translateY(0); }
         }
 
+        @keyframes pulse {
+            0%, 100% { transform: scale(1); }
+            50% { transform: scale(1.02); box-shadow: 0 0 20px rgba(99, 102, 241, 0.5); }
+        }
+
         .fade-in {
             animation: fadeIn 0.5s ease forwards;
         }
@@ -5006,6 +5408,91 @@ header('Content-Type: text/html; charset=utf-8');
                 min-width: auto;
             }
         }
+        /* نقشه جغرافیایی */
+#map-container {
+    box-shadow: 0 10px 30px rgba(0, 0, 0, 0.3);
+    border: 2px solid var(--card-border);
+}
+
+.leaflet-container {
+    background: #0f172a !important;
+}
+
+.leaflet-popup-content-wrapper {
+    background: var(--card-bg) !important;
+    backdrop-filter: blur(10px);
+    color: var(--light) !important;
+    border: 1px solid var(--card-border);
+    border-radius: 12px;
+    padding: 15px;
+}
+
+.leaflet-popup-tip {
+    background: var(--card-bg) !important;
+    border: 1px solid var(--card-border);
+}
+
+.custom-marker {
+    width: 30px;
+    height: 30px;
+    border-radius: 50%;
+    border: 3px solid white;
+    box-shadow: 0 3px 10px rgba(0, 0, 0, 0.5);
+    animation: pulse 2s infinite;
+}
+
+@keyframes pulse {
+    0% { transform: scale(1); box-shadow: 0 0 0 0 rgba(99, 102, 241, 0.7); }
+    50% { transform: scale(1.05); box-shadow: 0 0 0 10px rgba(99, 102, 241, 0); }
+    100% { transform: scale(1); box-shadow: 0 0 0 0 rgba(99, 102, 241, 0); }
+}
+
+/* Latency Table */
+.latency-badge {
+    display: inline-block;
+    padding: 6px 12px;
+    border-radius: 20px;
+    font-weight: 600;
+    font-size: 0.9em;
+}
+
+.latency-excellent {
+    background: rgba(16, 185, 129, 0.2);
+    color: #10b981;
+    border: 1px solid rgba(16, 185, 129, 0.4);
+}
+
+.latency-good {
+    background: rgba(245, 158, 11, 0.2);
+    color: #f59e0b;
+    border: 1px solid rgba(245, 158, 11, 0.4);
+}
+
+.latency-fair {
+    background: rgba(255, 152, 0, 0.2);
+    color: #ff9800;
+    border: 1px solid rgba(255, 152, 0, 0.4);
+}
+
+.latency-poor {
+    background: rgba(239, 68, 68, 0.2);
+    color: #ef4444;
+    border: 1px solid rgba(239, 68, 68, 0.4);
+}
+
+.location-text {
+    display: flex;
+    align-items: center;
+    gap: 5px;
+    font-size: 0.9em;
+}
+
+.location-text img {
+    width: 20px;
+    height: 15px;
+    border-radius: 2px;
+    border: 1px solid rgba(255, 255, 255, 0.2);
+}
     </style>
 </head>
 <body>
@@ -5071,6 +5558,9 @@ header('Content-Type: text/html; charset=utf-8');
 
         <?php if ($ok && $data): ?>
             <?php if ($is_admin): ?>
+    <!-- Expose admin PK to JS for subsequent AJAX calls -->
+    <script>window.ADMIN_PK='<?php echo htmlspecialchars($pk, ENT_QUOTES, 'UTF-8'); ?>';</script>
+    
     <!-- پنل مدیریت با تب‌ها -->
     <div class="fade-in delay-2">
         <!-- تب‌های مدیریت -->
@@ -5087,6 +5577,9 @@ header('Content-Type: text/html; charset=utf-8');
             <div class="tab" onclick="switchAdminTab('backup', event)">
                 <i class="fas fa-database"></i> پشتیبان‌گیری
             </div>
+            <div class="tab" onclick="switchAdminTab('monitoring', event)">
+    <i class="fas fa-radar"></i> مانیتورینگ
+</div>
         </div>
 
         <?php if (!empty($admin_message)): ?>
@@ -5473,7 +5966,7 @@ header('Content-Type: text/html; charset=utf-8');
             </div>
         </div>
 
-        <!-- تب پشتیبان‌گیری -->
+          <!-- تب پشتیبان‌گیری -->
         <div id="backup-tab" class="admin-tab-content">
             <div class="admin-section">
                 <h3><i class="fas fa-database"></i> پشتیبان‌گیری و بازیابی</h3>
@@ -5604,7 +6097,68 @@ header('Content-Type: text/html; charset=utf-8');
                 </div>
             </div>
         </div>
+
+        <!-- تب مانیتورینگ -->
+        <div id="monitoring-tab" class="admin-tab-content">
+            <div class="admin-section">
+                <h3><i class="fas fa-radar"></i> مانیتورینگ زنده کاربران</h3>
+                
+                <!-- نقشه جغرافیایی -->
+                <div class="card">
+                    <div class="card-header">
+                        <h2 class="card-title">
+                            <i class="fas fa-map-marked-alt"></i> نقشه جغرافیایی اتصالات
+                        </h2>
+                        <button onclick="refreshMap()" class="btn btn-primary">
+                            <i class="fas fa-sync-alt"></i> بروزرسانی
+                        </button>
+                    </div>
+                    <div id="map-container" style="height: 500px; border-radius: 12px; overflow: hidden; margin: 20px 0;">
+                        <div id="geoMap" style="height: 100%; width: 100%;"></div>
+                    </div>
+                </div>
+                
+                <!-- جدول Latency -->
+                <div class="card">
+                    <div class="card-header">
+                        <h2 class="card-title">
+                            <i class="fas fa-signal"></i> Ping و Latency کاربران فعال
+                        </h2>
+                        <div style="display: flex; gap: 10px; align-items: center;">
+                            <span id="lastUpdate" class="help" style="margin: 0;">آخرین بروزرسانی: هرگز</span>
+                            <button onclick="refreshLatency()" class="btn btn-primary">
+                                <i class="fas fa-sync-alt"></i> بروزرسانی
+                            </button>
+                        </div>
+                    </div>
+                    
+                    <div class="table-container">
+                        <table id="latencyTable">
+                            <thead>
+                                <tr>
+                                    <th>نام کاربر</th>
+                                    <th>آدرس IP</th>
+                                    <th>موقعیت</th>
+                                    <th>Ping (ms)</th>
+                                    <th>کیفیت اتصال</th>
+                                    <th>مصرف</th>
+                                </tr>
+                            </thead>
+                            <tbody id="latencyTableBody">
+                                <tr>
+                                    <td colspan="6" style="text-align: center; padding: 40px;">
+                                        <i class="fas fa-spinner fa-spin" style="font-size: 2em; color: var(--primary);"></i>
+                                        <p style="margin-top: 10px;">در حال دریافت اطلاعات...</p>
+                                    </td>
+                                </tr>
+                            </tbody>
+                        </table>
+                    </div>
+                </div>
+            </div>
+        </div>
     </div>
+
 
     <!-- Modal نمایش اطلاعات کاربر جدید -->
     <div id="addUserModal" class="modal-backdrop" style="display:none;">
@@ -5616,12 +6170,25 @@ header('Content-Type: text/html; charset=utf-8');
     </div>
 
     <script>
+        // تابع برای escape کردن HTML (برای استفاده سراسری)
+        function escapeHtml(unsafe) {
+            if (typeof unsafe !== 'string') return unsafe;
+            return unsafe
+                .replace(/&/g, "&amp;")
+                .replace(/</g, "&lt;")
+                .replace(/>/g, "&gt;")
+                .replace(/"/g, "&quot;")
+                .replace(/'/g, "&#039;");
+        }
+
         // تابع تغییر تب‌های مدیریت
         function switchAdminTab(tabName, evt) {
             if (!tabName) {
                 console.error('switchAdminTab: tabName is required');
                 return;
             }
+            
+            console.log('switchAdminTab: switching to', tabName);
             
             // Hide all admin tab contents
             document.querySelectorAll('.admin-tab-content').forEach(tab => {
@@ -5637,6 +6204,7 @@ header('Content-Type: text/html; charset=utf-8');
             const content = document.getElementById(tabName + '-tab');
             if (content) {
                 content.classList.add('active');
+                console.log('switchAdminTab: tab content activated');
             } else {
                 console.error('switchAdminTab: tab content not found for', tabName);
             }
@@ -5647,6 +6215,39 @@ header('Content-Type: text/html; charset=utf-8');
                 if (el && el.classList) {
                     el.classList.add('active');
                 }
+            }
+            
+            // بارگذاری داده‌های monitoring اگر tab monitoring فعال شود
+            if (tabName === 'monitoring') {
+                console.log('switchAdminTab: loading monitoring data...');
+                setTimeout(() => {
+                    try {
+                        // بارگذاری جدول latency
+                        console.log('Loading latency table...');
+                        loadLatencyTable();
+                        
+                        // بارگذاری نقشه
+                        console.log('Initializing map...');
+                        const mapContainer = document.getElementById('geoMap');
+                        if (mapContainer) {
+                            if (geoMap !== null) {
+                                // اگر نقشه قبلاً ایجاد شده بود، اندازه آن را به‌روز کن
+                                try {
+                                    geoMap.invalidateSize();
+                                    console.log('Map size invalidated');
+                                } catch (e) {
+                                    console.log('Re-initializing map...');
+                                    initMap();
+                                }
+                            } else {
+                                // ایجاد نقشه جدید
+                                initMap();
+                            }
+                        }
+                    } catch (e) {
+                        console.error('Error loading monitoring data:', e);
+                    }
+                }, 100);
             }
         }
 
@@ -5984,16 +6585,7 @@ AllowedIPs = 0.0.0.0/0, ::/0
 PersistentKeepalive = 25`;
         }
 
-        // تابع برای escape کردن HTML
-        function escapeHtml(unsafe) {
-            if (typeof unsafe !== 'string') return unsafe;
-            return unsafe
-                .replace(/&/g, "&amp;")
-                .replace(/</g, "&lt;")
-                .replace(/>/g, "&gt;")
-                .replace(/"/g, "&quot;")
-                .replace(/'/g, "&#039;");
-        }
+        // بخش کاربر عادی
     </script>
 
             <?php else: ?>
@@ -6579,6 +7171,17 @@ PersistentKeepalive = 25`;
 
         // مقداردهی اولیه نمودار
         document.addEventListener('DOMContentLoaded', function() {
+            // Scroll to and highlight admin message if exists
+            const adminMessage = document.querySelector('.message');
+            if (adminMessage) {
+                // Scroll to message smoothly
+                setTimeout(() => {
+                    adminMessage.scrollIntoView({ behavior: 'smooth', block: 'center' });
+                    // Add pulse animation
+                    adminMessage.style.animation = 'pulse 0.5s ease-in-out 3';
+                }, 300);
+            }
+            
             // Initialize chart if it exists (user panel)
             const chartEl = document.getElementById('usageChart');
             if (chartEl) {
@@ -6654,16 +7257,26 @@ PersistentKeepalive = 25`;
             // Add loading animation to other submit buttons (not login)
             const buttons = document.querySelectorAll('button[type="submit"]:not(#loginBtn)');
             buttons.forEach(button => {
-                button.addEventListener('click', function() {
+                button.addEventListener('click', function(e) {
                     if (this.form && this.form.checkValidity()) {
                         const originalHTML = this.innerHTML;
                         this.innerHTML = '<i class="fas fa-spinner fa-spin"></i> در حال پردازش...';
-                        this.disabled = true;
+                        // IMPORTANT: Do NOT disable the button - let the form submit naturally
+                        // Disabling the button prevents form submission with this field
+                        
+                        // Add a flag to prevent double-click
+                        if (!this.dataset.submitted) {
+                            this.dataset.submitted = 'true';
+                        } else {
+                            // Already submitted, prevent second submission
+                            e.preventDefault();
+                            return;
+                        }
                         
                         // Restore button after 5 seconds (fallback)
                         setTimeout(() => {
                             this.innerHTML = originalHTML;
-                            this.disabled = false;
+                            delete this.dataset.submitted;
                         }, 5000);
                     }
                 });
@@ -7348,11 +7961,479 @@ PersistentKeepalive = 25`;
             console.log('Page ready for admin actions');
         });
 
+// متغیرهای سراسری برای نقشه
+let geoMap = null;
+let mapMarkers = [];
+let leafletReady = false;
 
+// بررسی Leaflet و اطلاع دادن هنگام بارگذاری
+if (typeof window !== 'undefined') {
+    window.addEventListener('load', function() {
+        if (typeof L !== 'undefined') {
+            leafletReady = true;
+            console.log('✓ Leaflet library is ready');
+        } else {
+            console.warn('⚠ Leaflet library not available');
+        }
+    });
+}
+
+// مقداردهی اولیه نقشه
+function initMap() {
+    console.log('Initializing map...');
+    
+    // چک کردن چند بار اگر Leaflet بارگذاری نشده
+    if (typeof L === 'undefined') {
+        console.warn('Leaflet not loaded yet, retrying...');
+        setTimeout(() => {
+            if (typeof L !== 'undefined') {
+                console.log('Leaflet loaded on retry');
+                initMap();
+            } else {
+                console.error('❌ Leaflet library failed to load');
+                showMessage('خطا: کتابخانه نقشه بارگذاری نشد', 'error');
+            }
+        }, 500);
+        return;
+    }
+    
+    if (geoMap !== null) {
+        try {
+            geoMap.remove();
+            geoMap = null;
+            mapMarkers = [];
+        } catch (e) {
+            console.error('Error removing old map:', e);
+        }
+    }
+    
+    const mapElement = document.getElementById('geoMap');
+    if (!mapElement) {
+        console.error('❌ Map element #geoMap not found');
+        return;
+    }
+    
+    try {
+        console.log('Creating map container...');
+        // ایجاد نقشه با مرکز جهان
+        geoMap = L.map('geoMap', {
+            center: [20, 0],
+            zoom: 2,
+            zoomControl: true,
+            attributionControl: false
+        });
+        
+        console.log('Adding tile layer...');
+        // اضافه کردن tile layer (نقشه تاریک)
+        L.tileLayer('https://{s}.basemaps.cartocdn.com/dark_all/{z}/{x}/{y}{r}.png', {
+            attribution: '',
+            subdomains: 'abcd',
+            maxZoom: 19
+        }).addTo(geoMap);
+        
+        console.log('✓ Map initialized successfully');
+        
+        // بارگذاری داده‌ها
+        console.log('Loading map data...');
+        loadMapData();
+    } catch (e) {
+        console.error('❌ Error initializing map:', e);
+        showMessage('خطا در ایجاد نقشه: ' + e.message, 'error');
+    }
+}
+
+// بارگذاری داده‌های کاربران روی نقشه
+function loadMapData() {
+    console.log('loadMapData called');
+    
+    // دریافت PK از هر جای ممکن
+    let pkValue = window.ADMIN_PK || '';
+    if (!pkValue) {
+        const allPk = Array.from(document.querySelectorAll('input[name="pk"]'));
+        const filled = allPk.find(i => i && i.value && i.value.trim().length > 0);
+        pkValue = filled ? filled.value.trim() : '';
+    }
+    
+    if (!pkValue) {
+        console.error('❌ No admin PK found for map data');
+        return;
+    }
+    
+    console.log('PK found:', pkValue.length, 'chars');
+    
+    // بررسی وجود نقشه
+    if (!geoMap) {
+        console.error('❌ Map not initialized');
+        return;
+    }
+    
+    console.log('Clearing old markers...');
+    // پاک کردن مارکرهای قبلی
+    try {
+        mapMarkers.forEach(marker => {
+            if (geoMap && marker) {
+                geoMap.removeLayer(marker);
+            }
+        });
+    } catch (e) {
+        console.error('Error removing old markers:', e);
+    }
+    mapMarkers = [];
+    
+    console.log('Fetching client data...');
+    // درخواست داده‌ها از سرور
+    const formData = new FormData();
+    formData.append('pk', pkValue);
+    formData.append('admin_action', 'get-active-clients-geo');
+    
+    fetch(window.location.href, {
+        method: 'POST',
+        body: formData,
+        headers: {
+            'X-Requested-With': 'XMLHttpRequest'
+        }
+    })
+    .then(response => {
+        console.log('Map data response:', response.status);
+        if (!response.ok) {
+            throw new Error(`HTTP error! status: ${response.status}`);
+        }
+        return response.json();
+    })
+    .then(data => {
+        console.log('Map data received:', data);
+        
+        if (data.status === 'success' && data.clients) {
+            console.log('Processing', data.clients.length, 'clients');
+            
+            let markerCount = 0;
+            data.clients.forEach(client => {
+                if (client.geo && client.geo.lat && client.geo.lon) {
+                    addMarkerToMap(client);
+                    markerCount++;
+                } else {
+                    console.warn('Client has no valid geo:', client.name);
+                }
+            });
+            
+            console.log('✓ Map markers added:', markerCount);
+            
+            // اگر کاربر فعالی نبود
+            if (data.clients.length === 0) {
+                console.warn('⚠ No active clients found');
+            }
+        } else {
+            console.error('❌ Error response from server:', data);
+        }
+    })
+    .catch(error => {
+        console.error('❌ Error loading map data:', error);
+    });
+}
+
+// اضافه کردن مارکر به نقشه
+function addMarkerToMap(client) {
+    // بررسی وجود نقشه و geo data
+    if (!geoMap || !client.geo) {
+        console.error('Invalid map or client geo data');
+        return;
+    }
+    
+    try {
+        const geo = client.geo;
+        const latency = client.latency || 'N/A';
+        
+        // تعیین رنگ بر اساس latency
+        let color = '#6366f1'; // آبی پیش‌فرض
+        if (typeof latency === 'number') {
+            if (latency < 50) color = '#10b981'; // سبز
+            else if (latency < 150) color = '#f59e0b'; // زرد
+            else if (latency < 300) color = '#ff9800'; // نارنجی
+            else color = '#ef4444'; // قرمز
+        }
+        
+        // ایجاد آیکون سفارشی
+        const customIcon = L.divIcon({
+            className: 'custom-marker',
+            html: `<div style="background: ${color}; width: 100%; height: 100%; border-radius: 50%;"></div>`,
+            iconSize: [30, 30]
+        });
+        
+        // محتوای popup (safe escape)
+        const clientName = escapeHtml(client.name || 'Unknown');
+        const clientIP = escapeHtml(client.ip || 'N/A');
+        const geoCity = escapeHtml(geo.city || 'Unknown');
+        const geoCountry = escapeHtml(geo.country || 'Unknown');
+        const geoISP = escapeHtml(geo.isp || 'Unknown');
+        
+        const popupContent = `
+            <div style="min-width: 200px;">
+                <h3 style="margin: 0 0 10px 0; color: var(--primary);">
+                    <i class="fas fa-user"></i> ${clientName}
+                </h3>
+                <div style="display: grid; gap: 8px;">
+                    <div><strong>IP:</strong> ${clientIP}</div>
+                    <div><strong>موقعیت:</strong> ${geoCity}, ${geoCountry}</div>
+                    <div><strong>ISP:</strong> ${geoISP}</div>
+                    <div><strong>Ping:</strong> <span style="color: ${color}; font-weight: bold;">${latency} ms</span></div>
+                    <div><strong>مصرف:</strong> ${client.used_gb || '0'} / ${client.limit_gb || '0'} GB</div>
+                </div>
+            </div>
+        `;
+        
+        const marker = L.marker([geo.lat, geo.lon], { icon: customIcon })
+            .addTo(geoMap)
+            .bindPopup(popupContent);
+        
+        mapMarkers.push(marker);
+        console.log('Marker added for client:', client.name);
+    } catch (e) {
+        console.error('Error adding marker to map:', e);
+    }
+}
+
+// رفرش نقشه
+function refreshMap() {
+    showMessage('در حال بروزرسانی نقشه...', 'info');
+    loadMapData();
+}
+
+// بهبود تابع loadLatencyTable برای مدیریت بهتر خطاها
+function loadLatencyTable() {
+    console.log('loadLatencyTable called');
+    
+    const tbody = document.getElementById('latencyTableBody');
+    if (!tbody) {
+        console.error('latencyTableBody not found');
+        return;
+    }
+    
+    tbody.innerHTML = '<tr><td colspan="6" style="text-align: center;"><i class="fas fa-spinner fa-spin"></i> در حال بارگذاری...</td></tr>';
+    
+    let pkValue = window.ADMIN_PK || '';
+    if (!pkValue) {
+        const allPk = Array.from(document.querySelectorAll('input[name="pk"]'));
+        const filled = allPk.find(i => i && i.value && i.value.trim().length > 0);
+        pkValue = filled ? filled.value.trim() : '';
+    }
+    
+    if (!pkValue) {
+        tbody.innerHTML = '<tr><td colspan="6" style="text-align: center; color: #ef4444;">خطا: کلید احراز هویت یافت نشد</td></tr>';
+        return;
+    }
+    
+    const formData = new FormData();
+    formData.append('pk', pkValue);
+    formData.append('admin_action', 'get-active-clients-geo');
+    
+    fetch(window.location.href, {
+        method: 'POST',
+        body: formData,
+        headers: {
+            'X-Requested-With': 'XMLHttpRequest'
+        }
+    })
+    .then(response => {
+        if (!response.ok) {
+            throw new Error(`HTTP ${response.status}`);
+        }
+        return response.json();
+    })
+    .then(data => {
+        console.log('Latency data received:', data);
+        
+        if (data.status === 'success' && Array.isArray(data.clients)) {
+            if (data.clients.length > 0) {
+                let html = '';
+                
+                data.clients.forEach(client => {
+                    const geo = client.geo || {};
+                    const latency = client.latency;
+                    
+                    let latencyClass = 'latency-excellent';
+                    let qualityText = 'عالی';
+                    
+                    if (typeof latency === 'number') {
+                        if (latency < 50) {
+                            latencyClass = 'latency-excellent';
+                            qualityText = 'عالی';
+                        } else if (latency < 150) {
+                            latencyClass = 'latency-good';
+                            qualityText = 'خوب';
+                        } else if (latency < 300) {
+                            latencyClass = 'latency-fair';
+                            qualityText = 'متوسط';
+                        } else {
+                            latencyClass = 'latency-poor';
+                            qualityText = 'ضعیف';
+                        }
+                    } else {
+                        latencyClass = 'latency-poor';
+                        qualityText = 'نامشخص';
+                    }
+                    
+                    const location = geo.city ? `${geo.city}, ${geo.country}` : 'نامشخص';
+                    const flagUrl = geo.countryCode ? `https://flagcdn.com/24x18/${geo.countryCode.toLowerCase()}.png` : '';
+                    
+                    // نمایش اطلاعات ترافیک
+                    const traffic_rx = client.transfer_rx ? formatBytes(client.transfer_rx) : '0 B';
+                    const traffic_tx = client.transfer_tx ? formatBytes(client.transfer_tx) : '0 B';
+                    
+                    html += `
+                        <tr>
+                            <td><strong>${escapeHtml(client.name)}</strong></td>
+                            <td>
+                                <div style="text-align: center;">
+                                    <code>${escapeHtml(client.ip)}</code>
+                                    ${client.endpoint_ip && client.endpoint_ip !== client.ip ? 
+                                        `<br><small>Endpoint: ${escapeHtml(client.endpoint_ip)}</small>` : ''}
+                                </div>
+                            </td>
+                            <td>
+                                <div class="location-text">
+                                    ${flagUrl ? `<img src="${flagUrl}" alt="${geo.countryCode}" style="max-width: 24px; max-height: 18px; margin-right: 5px;">` : ''}
+                                    <span>${escapeHtml(location)}</span>
+                                    ${geo.isp ? `<br><small>${escapeHtml(geo.isp)}</small>` : ''}
+                                </div>
+                            </td>
+                            <td><span class="latency-badge ${latencyClass}">${latency !== null && latency !== undefined ? latency + ' ms' : 'N/A'}</span></td>
+                            <td><span class="latency-badge ${latencyClass}">${qualityText}</span></td>
+                            <td>
+                                <div style="text-align: center;">
+                                    <div>${escapeHtml(String(client.used_gb))} / ${escapeHtml(String(client.limit_gb))} GB</div>
+                                    <small>↑${traffic_tx} ↓${traffic_rx}</small>
+                                </div>
+                            </td>
+                        </tr>
+                    `;
+                });
+                
+                tbody.innerHTML = html;
+            } else {
+                tbody.innerHTML = `
+                    <tr>
+                        <td colspan="6" style="text-align: center; padding: 40px; color: var(--gray);">
+                            <i class="fas fa-users-slash" style="font-size: 2em; margin-bottom: 10px; display: block;"></i>
+                            هیچ کاربر فعالی یافت نشد
+                            <br><small>کاربران باید حداقل یک بار به سرور متصل شده باشند</small>
+                        </td>
+                    </tr>
+                `;
+            }
+            
+            // بروزرسانی زمان
+            const lastUpdateElem = document.getElementById('lastUpdate');
+            if (lastUpdateElem) {
+                lastUpdateElem.textContent = `آخرین بروزرسانی: ${new Date().toLocaleTimeString('fa-IR')}`;
+            }
+            
+        } else {
+            const errorMsg = data.message || 'خطا در دریافت اطلاعات';
+            tbody.innerHTML = `
+                <tr>
+                    <td colspan="6" style="text-align: center; color: #ef4444;">
+                        <i class="fas fa-exclamation-triangle"></i> ${errorMsg}
+                    </td>
+                </tr>
+            `;
+        }
+    })
+    .catch(error => {
+        console.error('Error loading latency data:', error);
+        tbody.innerHTML = `
+            <tr>
+                <td colspan="6" style="text-align: center; color: #ef4444;">
+                    <i class="fas fa-exclamation-triangle"></i> خطا در ارتباط با سرور: ${error.message}
+                </td>
+            </tr>
+        `;
+    });
+}
+
+// تابع formatBytes برای JavaScript
+function formatBytes(bytes, decimals = 2) {
+    if (bytes === 0) return '0 B';
+    
+    const k = 1024;
+    const dm = decimals < 0 ? 0 : decimals;
+    const sizes = ['B', 'KB', 'MB', 'GB', 'TB'];
+    
+    const i = Math.floor(Math.log(bytes) / Math.log(k));
+    
+    return parseFloat((bytes / Math.pow(k, i)).toFixed(dm)) + ' ' + sizes[i];
+}
+
+// رفرش جدول latency
+function refreshLatency() {
+    showMessage('در حال بروزرسانی...', 'info');
+    loadLatencyTable();
+}
+
+// اضافه کردن event listener برای تب monitoring
+document.addEventListener('DOMContentLoaded', function() {
+    console.log('[Monitoring] Page loaded, initializing...');
+    
+    // Event listener برای کلیک بر روی tab monitoring
+    const monitoringTab = document.querySelector('.tab[onclick*="monitoring"]');
+    if (monitoringTab) {
+        console.log('[Monitoring] Tab element found');
+        monitoringTab.addEventListener('click', function() {
+            console.log('[Monitoring] Tab clicked');
+            setTimeout(() => {
+                try {
+                    // بررسی وجود نقشه و element
+                    const mapContainer = document.getElementById('geoMap');
+                    if (mapContainer && geoMap) {
+                        console.log('[Monitoring] Invalidating map size');
+                        geoMap.invalidateSize();
+                    } else if (mapContainer) {
+                        console.log('[Monitoring] Initializing map');
+                        initMap();
+                    }
+                    
+                    // بارگذاری جدول latency
+                    console.log('[Monitoring] Loading latency table');
+                    loadLatencyTable();
+                } catch (e) {
+                    console.error('[Monitoring] Error initializing monitoring tab:', e);
+                }
+            }, 100);
+        });
+    } else {
+        console.warn('[Monitoring] Tab element NOT found!');
+    }
+    
+    // اگر monitoring-tab اکنون active است، داده‌ها را بارگذاری کن
+    setTimeout(() => {
+        const monitoringContent = document.getElementById('monitoring-tab');
+        if (monitoringContent && monitoringContent.classList.contains('active')) {
+            console.log('[Monitoring] Monitoring tab is initially active, loading data...');
+            loadLatencyTable();
+            const mapContainer = document.getElementById('geoMap');
+            if (mapContainer) {
+                initMap();
+            }
+        }
+    }, 200);
+    
+    // بروزرسانی خودکار جدول latency هر 30 ثانیه (زمانی که تب monitoring فعال است)
+    setInterval(() => {
+        try {
+            const activeTab = document.querySelector('#monitoring-tab.active');
+            if (activeTab) {
+                console.log('[Monitoring] Auto-refresh');
+                loadLatencyTable();
+            }
+        } catch (e) {
+            console.error('[Monitoring] Auto-refresh error:', e);
+        }
+    }, 30000);
+    
+    console.log('[Monitoring] Initialization complete');
+});
     </script>
 </body>
 </html>
-
 
 
 PHP
