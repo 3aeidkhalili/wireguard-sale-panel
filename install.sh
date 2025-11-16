@@ -1044,13 +1044,15 @@ fi
 
 # محاسبات
 used_gb=$(echo "$used_bytes" | awk '{printf "%.2f", $1/1024/1024/1024}')
-limit_gb=$(echo "$limit_bytes" | awk '{printf "%.2f", $1/1024/1024/1024}')
 
 if [[ "$limit_bytes" -gt 0 ]]; then
+    limit_gb=$(echo "$limit_bytes" | awk '{printf "%.2f", $1/1024/1024/1024}')
     remaining_gb=$(echo "$used_bytes $limit_bytes" | awk '{printf "%.2f", ($2-$1)/1024/1024/1024}')
     usage_percent=$(echo "$used_bytes $limit_bytes" | awk '{printf "%.1f", ($1/$2)*100}')
 else
-    remaining_gb="Unlimited"
+    # اگر محدودیت نباشد
+    limit_gb="∞"
+    remaining_gb="∞"
     usage_percent="0.0"
 fi
 
@@ -1060,7 +1062,12 @@ expiry_seconds=$(date -d "$expiry_date" +%s 2>/dev/null || echo "$now_seconds")
 days_remaining=$(( (expiry_seconds - now_seconds) / 86400 ))
 
 if [[ $days_remaining -lt 0 ]]; then
-    days_remaining=0
+    days_remaining="0"
+else
+    # اگر تاریخ انقضا بسیار دور باشد (مثلاً 2099)، نمایش ∞
+    if [[ $days_remaining -gt 36500 ]]; then
+        days_remaining="∞"
+    fi
 fi
 
 # اطلاعات سرور
@@ -1242,6 +1249,73 @@ SUDO
     ok "Admin scripts and sudo permissions configured"
 }
 
+create_sync_web_db() {
+    log "Creating sync_web_db script and cron..."
+
+    cat > /usr/local/bin/sync_web_db << 'EOF'
+#!/usr/bin/env bash
+set -euo pipefail
+
+# همگام‌سازی دیتابیس‌های WireGuard بین /etc و وب
+ETC_DIR="/etc/wireguard"
+WEB_ROOT="/var/www/wireguard"
+WEB_DB_DIR="$WEB_ROOT/db"
+ETC_CLIENTS_DIR="$ETC_DIR/clients"
+WEB_CLIENTS_DIR="$WEB_ROOT/clients"
+
+mkdir -p "$WEB_DB_DIR" "$WEB_CLIENTS_DIR"
+
+DB_FILES=("clients.db" "quota.db" "admin.db" "endpoint.db" "dns.db")
+
+sync_one_db() {
+    local name="$1"
+    local etc_file="$ETC_DIR/$name"
+    local web_file="$WEB_DB_DIR/$name"
+
+    # هر دو وجود دارند → هر کدام جدیدتر است، روی دیگری کپی می‌شود
+    if [[ -f "$etc_file" && -f "$web_file" ]]; then
+        if [[ "$etc_file" -nt "$web_file" ]]; then
+            cp -p "$etc_file" "$web_file"
+        else
+            cp -p "$web_file" "$etc_file"
+        fi
+    # فقط /etc دارد → به وب کپی کن
+    elif [[ -f "$etc_file" ]]; then
+        cp -p "$etc_file" "$web_file"
+    # فقط وب دارد → به /etc کپی کن
+    elif [[ -f "$web_file" ]]; then
+        cp -p "$web_file" "$etc_file"
+    fi
+}
+
+for db in "${DB_FILES[@]}"; do
+    sync_one_db "$db"
+done
+
+# همگام‌سازی کانفیگ‌های کلاینت (اینجا /etc را منبع اصلی می‌گیریم)
+if [[ -d "$ETC_CLIENTS_DIR" ]]; then
+    rsync -a --delete "$ETC_CLIENTS_DIR"/ "$WEB_CLIENTS_DIR"/ 2>/dev/null || true
+fi
+
+# ست کردن مالکیت برای وب (اگر وجود داشت)
+if id -u www-data >/dev/null 2>&1; then
+    chown www-data:www-data "$WEB_DB_DIR"/*.db 2>/dev/null || true
+    chown -R www-data:www-data "$WEB_CLIENTS_DIR" 2>/dev/null || true
+fi
+EOF
+
+    chmod +x /usr/local/bin/sync_web_db
+
+    # کران برای اجرای هر ۱ دقیقه
+    cat > /etc/cron.d/wg-sync-web-db << 'EOF'
+* * * * * root /usr/local/bin/sync_web_db >/dev/null 2>&1
+EOF
+
+    chmod 644 /etc/cron.d/wg-sync-web-db
+
+    ok "sync_web_db script and 1-minute cron created"
+}
+
 install_web() {
     log "Installing and configuring web panel..."
     # Ensure OS detection when running web-install directly
@@ -1260,6 +1334,7 @@ install_web() {
     esac
 
     create_admin_scripts
+    create_sync_web_db
     
     # تأیید نصب اسکریپت‌ها
     verify_installation || return 1
@@ -2858,12 +2933,31 @@ function get_weekly_usage_detailed($username, $days = 7) {
     $download_data = array();
     $total_data = array();
     
+    // بررسی پوشه usage
+    $usage_dir = '/etc/wireguard/usage';
+    if (!is_dir($usage_dir)) {
+        // اگر پوشه وجود ندارد، آرایه‌های خالی برگردان
+        for ($i = $days - 1; $i >= 0; $i--) {
+            $ts = time() - ($i * 86400);
+            $labels[] = date('Y/m/d', $ts);
+            $total_data[] = 0;
+            $upload_data[] = 0;
+            $download_data[] = 0;
+        }
+        return array(
+            'labels' => $labels,
+            'total' => $total_data,
+            'upload' => $upload_data,
+            'download' => $download_data
+        );
+    }
+    
     for ($i = $days - 1; $i >= 0; $i--) {
         $ts = time() - ($i * 86400);
         $date = date('Y-m-d', $ts);
         $labels[] = date('Y/m/d', $ts);
         
-        $csv = '/etc/wireguard/usage/' . $date . '.csv';
+        $csv = $usage_dir . '/' . $date . '.csv';
         $bytes = 0;
         $upload_bytes = 0;
         $download_bytes = 0;
@@ -2892,6 +2986,7 @@ function get_weekly_usage_detailed($username, $days = 7) {
             }
         }
         
+        // تبدیل صحیح bytes به GB
         $total_data[] = round($bytes / (1024 * 1024 * 1024), 2);
         $upload_data[] = round($upload_bytes / (1024 * 1024 * 1024), 2);
         $download_data[] = round($download_bytes / (1024 * 1024 * 1024), 2);
@@ -4293,52 +4388,117 @@ function contains_error($str)
 {
     return strpos($str, 'خطا') !== false;
 }
-// دريافت اطلاعات لحظه اي سرور
+// دریافت اطلاعات لحظه‌ای سرور بدون استفاده از shell
 function get_live_server_stats()
 {
     $stats = array();
 
-    // اطلاعات CPU - استفاده از دستور صحیح
-    $cpu_usage = @shell_exec("top -bn2 -d 0.5 | grep 'Cpu(s)' | tail -n 1 | awk '{print $2}' | sed 's/%us,//' | sed 's/us,//'");
-    if (empty($cpu_usage)) {
-        // روش جایگزین با استفاده از mpstat
-        $cpu_usage = @shell_exec("grep 'cpu ' /proc/stat | awk '{usage=(\$2+\$4)*100/(\$2+\$4+\$5)} END {print usage}'");
+    // اطلاعات CPU - خواندن مستقیم از /proc/stat
+    $cpu_usage = 0;
+    $proc_stat = @file_get_contents('/proc/stat');
+    if ($proc_stat) {
+        $lines = explode("\n", trim($proc_stat));
+        if (count($lines) > 0) {
+            $first_line = $lines[0];
+            $cpu = preg_split('/\s+/', $first_line);
+            
+            if (count($cpu) >= 5) {
+                // cpu user nice system idle
+                $user = intval($cpu[1]);
+                $nice = intval($cpu[2]);
+                $system = intval($cpu[3]);
+                $idle = intval($cpu[4]);
+                
+                $total = $user + $nice + $system + $idle;
+                $work = $user + $nice + $system;
+                
+                if ($total > 0) {
+                    $cpu_usage = round(($work / $total) * 100, 1);
+                }
+            }
+        }
     }
-    $stats['cpu_usage'] = floatval(trim($cpu_usage)) ?: 0;
+    $stats['cpu_usage'] = floatval($cpu_usage) ?: 0;
 
-    // اطلاعات حافظه
-    $memory_info = @shell_exec("free -m | grep Mem:");
-    if ($memory_info) {
-        $memory_parts = preg_split('/\s+/', trim($memory_info));
-        $total_memory = $memory_parts[1] ?? 0;
-        $used_memory = $memory_parts[2] ?? 0;
-        $stats['memory_usage'] = $total_memory > 0 ? round(($used_memory / $total_memory) * 100, 1) : 0;
-        $stats['memory_used'] = $used_memory;
-        $stats['memory_total'] = $total_memory;
+    // اطلاعات حافظه - خواندن مستقیم از /proc/meminfo
+    $stats['memory_usage'] = 0;
+    $stats['memory_used'] = 0;
+    $stats['memory_total'] = 0;
+    
+    $meminfo = @file_get_contents('/proc/meminfo');
+    if ($meminfo) {
+        $mem_lines = explode("\n", $meminfo);
+        $mem_data = array();
+        
+        foreach ($mem_lines as $line) {
+            if (preg_match('/^(\w+):\s+(\d+)/', $line, $matches)) {
+                $mem_data[$matches[1]] = intval($matches[2]);
+            }
+        }
+        
+        if (isset($mem_data['MemTotal']) && $mem_data['MemTotal'] > 0) {
+            $total = $mem_data['MemTotal'];
+            $available = $mem_data['MemAvailable'] ?? $mem_data['MemFree'] ?? 0;
+            $used = $total - $available;
+            
+            $stats['memory_usage'] = round(($used / $total) * 100, 1);
+            $stats['memory_used'] = round($used / 1024, 0); // MB
+            $stats['memory_total'] = round($total / 1024, 0); // MB
+        }
+    }
+
+    // اطلاعات دیسک - استفاده از disk_total_space و disk_free_space
+    $disk_total = @disk_total_space('/');
+    $disk_free = @disk_free_space('/');
+    
+    if ($disk_total && $disk_free !== false) {
+        $disk_used = $disk_total - $disk_free;
+        $stats['disk_usage'] = round(($disk_used / $disk_total) * 100, 1);
     } else {
-        $stats['memory_usage'] = 0;
-        $stats['memory_used'] = 0;
-        $stats['memory_total'] = 0;
+        $stats['disk_usage'] = 0;
     }
 
-    // اطلاعات ديسك
-    $disk_usage = @shell_exec("df -h / | awk 'NR==2 {print $5}' | tr -d '%'");
-    $stats['disk_usage'] = intval(trim($disk_usage)) ?: 0;
-
-    // اطلاعات ترافيك شبكه (nload)
-    $network_stats = @shell_exec("cat /proc/net/dev | grep -E '(eth0|ens|enp)' | head -1");
-    if ($network_stats) {
-        $network_parts = preg_split('/\s+/', trim($network_stats));
-        $stats['network_rx'] = isset($network_parts[1]) ? round($network_parts[1] / 1024 / 1024, 2) : 0; // MB
-        $stats['network_tx'] = isset($network_parts[9]) ? round($network_parts[9] / 1024 / 1024, 2) : 0; // MB
-    } else {
-        $stats['network_rx'] = 0;
-        $stats['network_tx'] = 0;
+    // اطلاعات ترافیک شبکه - خواندن مستقیم از /proc/net/dev
+    $network_rx_total = 0;
+    $network_tx_total = 0;
+    
+    $net_dev = @file_get_contents('/proc/net/dev');
+    if ($net_dev) {
+        $lines = explode("\n", $net_dev);
+        foreach ($lines as $line) {
+            // رد کردن header و loopback
+            if (strpos($line, ':') === false || strpos($line, 'lo:') !== false) {
+                continue;
+            }
+            
+            $parts = preg_split('/\s+|:/', trim($line), -1, PREG_SPLIT_NO_EMPTY);
+            if (count($parts) >= 10) {
+                $network_rx_total += intval($parts[1]); // bytes received
+                $network_tx_total += intval($parts[9]); // bytes transmitted
+            }
+        }
     }
+    
+    $stats['network_rx'] = round($network_rx_total / 1024 / 1024, 2); // MB
+    $stats['network_tx'] = round($network_tx_total / 1024 / 1024, 2); // MB
 
-    // آپ تايم سرور
-    $uptime = @shell_exec("uptime -p");
-    $stats['uptime'] = $uptime ? trim($uptime) : 'نامشخص';
+    // آپ تایم سرور
+    $uptime_str = 'نامشخص';
+    $uptime_raw = @file_get_contents('/proc/uptime');
+    if ($uptime_raw) {
+        $uptime_seconds = intval(floatval(explode(' ', $uptime_raw)[0]));
+        $days = floor($uptime_seconds / 86400);
+        $hours = floor(($uptime_seconds % 86400) / 3600);
+        $minutes = floor(($uptime_seconds % 3600) / 60);
+        
+        $uptime_str = '';
+        if ($days > 0) $uptime_str .= "{$days} روز ";
+        if ($hours > 0) $uptime_str .= "{$hours} ساعت ";
+        if ($minutes > 0) $uptime_str .= "{$minutes} دقیقه";
+        
+        $uptime_str = trim($uptime_str) ?: '0 دقیقه';
+    }
+    $stats['uptime'] = $uptime_str;
 
     return $stats;
 }
@@ -4350,12 +4510,25 @@ function get_weekly_usage($user)
     $data = array();
     if ($user === null) { $user = ''; }
 
+    // بررسی پوشه usage
+    $usage_dir = '/etc/wireguard/usage';
+    if (!is_dir($usage_dir)) {
+        // اگر پوشه وجود ندارد، داده‌های خالی برگردان
+        for ($i = 6; $i >= 0; $i--) {
+            $ts = time() - ($i * 86400);
+            $date = date('Y-m-d', $ts);
+            $labels[] = $date;
+            $data[] = 0;
+        }
+        return array('labels' => $labels, 'data' => $data);
+    }
+
     for ($i = 6; $i >= 0; $i--) {
         $ts = time() - ($i * 86400);
         $date = date('Y-m-d', $ts);
         $labels[] = $date;
 
-        $csv = '/etc/wireguard/usage/' . $date . '.csv';
+        $csv = $usage_dir . '/' . $date . '.csv';
         $bytes = 0;
         if (is_readable($csv)) {
             $lines = @file($csv, FILE_IGNORE_NEW_LINES | FILE_SKIP_EMPTY_LINES);
@@ -4363,7 +4536,7 @@ function get_weekly_usage($user)
                 foreach ($lines as $line) {
                     $parts = explode('|', trim($line), 2);
                     if (count($parts) >= 2 && $parts[0] === $user) {
-                        // ensure numeric
+                        // تأیید numeric بودن و تبدیل صحیح به int
                         $val = preg_replace('/[^0-9]/', '', (string)$parts[1]);
                         $bytes = is_numeric($val) ? intval($val) : 0;
                         break;
