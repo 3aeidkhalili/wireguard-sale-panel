@@ -110,6 +110,7 @@ udp2raw_amd64.exe -c -l0.0.0.0:3333 -r116.203.100.203:1376 -k "passssssssaa34swd
 
 
 
-
+اموزش :
+https://www.youtube.com/@3aeidkhalili
 
 
