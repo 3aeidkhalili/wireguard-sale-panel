@@ -85,5 +85,31 @@ www-data ALL=(ALL) NOPASSWD: /bin/systemctl status wg-quick@wg0, /bin/systemctl 
 
 
 
+عبور از محدودیت udp :
+
+<img width="1000" height="385" alt="image" src="https://github.com/user-attachments/assets/5cb17acd-d375-4e23-bae1-e61018f2b38e" />
+<img width="986" height="366" alt="image" src="https://github.com/user-attachments/assets/dcc31283-94a8-4909-891b-eddf687641c3" />
+
+داخل سرور :
+```basg
+curl -Lo /root/udp2raw_amd64 https://github.com/iSegaro/UDP2Raw/raw/main/udp2raw_amd64 && chmod +x udp2raw_amd64
+```
+داخل ویندوز :
+```bash
+https://github.com/iSegaro/UDP2Raw/raw/main/udp2raw_amd64.exe
+```
+اجرا تو سرور :
+```bash
+nohup ./udp2raw_amd64 -s -l 0.0.0.0:1376 -r 127.0.0.1:1010 -k passssssssaa34swd --raw-mode icmp  --seq-mode 1 -a > udp2raw.txt 2>&1 &
+```
+اجرا تو مسیر برنامه ویندوز:
+```bash
+udp2raw_amd64.exe -c -l0.0.0.0:3333 -r116.203.100.203:1376 -k "passssssssaa34swd" --raw-mode icmp  --seq-mode 1  
+```
+
+
+
+
+
 
 
